@@ -9,7 +9,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 import excel_filter
-from excel_filter import (detect_columns, distinct, export, load, production_summary, read,
+from excel_filter import (detect_columns, distinct, download, load, production_summary, read,
                           sentences_with, summarize)
 
 HEADER = ("Data", "Dia", "Horário", "Hora", "Turno", "Plan", "Produzido", "Principais perdas", "Vazia")
@@ -73,9 +73,15 @@ class Summary(unittest.TestCase):
         self.assertEqual((result["found"], result["read"]), (4, 4))
         self.assertEqual(result["period"], (date(2026, 1, 10), date(2026, 4, 1)))
 
-    def test_specific_hour(self):
-        result = self.run_summary(hour="06h - 07h")
-        self.assertEqual(column(result, "Data"), [datetime(2026, 1, 10), "05/03/2026"])
+    def test_shift_goes_by_the_hour_the_row_starts_at(self):
+        self.assertEqual(self.run_summary(shift=1)["found"], 4)  # 06h, 07h, 06h, 08h
+        self.assertEqual(self.run_summary(shift=2)["found"], 0)
+
+    def test_shift_of_each_hour(self):
+        said = ("06h - 07h", "13h - 14h", "14h - 15h", "21:00", "22h - 23h", "00h - 01h",
+                "05h - 06h", "", None, "sem hora")
+        self.assertEqual([excel_filter.shift_of(h) for h in said],
+                         [1, 1, 2, 2, 3, 3, 3, None, None, None])
 
     def test_keyword_is_case_insensitive_and_ors_terms(self):
         self.assertEqual(self.run_summary(terms=["TAMPADORA"])["found"], 2)
@@ -87,8 +93,8 @@ class Summary(unittest.TestCase):
         self.assertEqual(result["period"], (date(2026, 2, 20), date(2026, 3, 5)))
 
     def test_three_filters_together(self):
-        result = self.run_summary(terms=["tampadora"], start=date(2026, 1, 1),
-                                  end=date(2026, 12, 31), hour="06h - 07h")
+        result = self.run_summary(terms=["tampadora"], start=date(2026, 3, 1),
+                                  end=date(2026, 12, 31), shift=1)
         self.assertEqual(column(result, "Principais perdas"),
                          ["Gasser - alarme nivel 1, e a tampadora ok"])
 
@@ -109,8 +115,8 @@ class Summary(unittest.TestCase):
         self.assertEqual(result["partial"], {"Produzido"})  # o ilegível não vira zero calado
 
     def test_empty_columns_are_dropped(self):
-        # essa hora não tem ocorrência escrita: some "Principais perdas" e "Vazia"
-        self.assertEqual(self.run_summary(hour="08h - 09h")["columns"],
+        # esse dia não tem ocorrência escrita: some "Principais perdas" e "Vazia"
+        self.assertEqual(self.run_summary(start=date(2026, 4, 1))["columns"],
                          ["Data", "Dia", "Horário", "Hora", "Turno", "Plan", "Produzido"])
 
     def test_no_results(self):
@@ -131,58 +137,32 @@ class Summary(unittest.TestCase):
             summarize(headers, rows, date_col="Data", start=date(2026, 1, 1))
 
 
-class Export(unittest.TestCase):
+class Download(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.src = workbook(self.tmp)
-        self.dst = Path(self.tmp) / "out.xlsx"
-        _, self.headers, self.rows = read(self.src)
+        _, self.headers, self.rows = read(workbook(self.tmp))
+        self.dst = Path(self.tmp) / "ocorrencias.xlsx"
 
-    def run_export(self, **kw):
-        kw.setdefault("date_col", "Data")
-        kw.setdefault("hour_col", "Horário")
-        kw.setdefault("text_col", "Principais perdas")
-        visible, exact = export(self.src, self.dst, "Dados", self.headers, self.rows, **kw)
-        sheet = load_workbook(self.dst)["Dados"]
-        shown = [sheet.cell(r, 8).value for r in range(2, sheet.max_row + 1)
-                 if not sheet.row_dimensions[r].hidden]
-        return visible, exact, shown, sheet
+    def written(self, rows, terms=(), line_col=""):
+        download(self.dst, self.headers, rows, line_col, "Data", "Horário",
+                 "Principais perdas", terms)
+        return [[c.value for c in row] for row in load_workbook(self.dst).active.iter_rows()]
 
-    def test_hides_without_deleting_and_writes_the_three_criteria(self):
-        visible, exact, shown, sheet = self.run_export(
-            terms=["tampadora"], start=date(2026, 1, 1), hour="06h - 07h")
-        self.assertEqual((visible, exact), (1, True))
-        self.assertEqual(shown, ["Gasser - alarme nivel 1, e a tampadora ok"])
-        self.assertEqual(sheet.max_row, 5)  # nothing deleted
-        self.assertEqual(sheet.auto_filter.ref, "A1:I5")
-        by_column = {c.colId: c for c in sheet.auto_filter.filterColumn}
-        self.assertEqual(by_column[7].customFilters.customFilter[0].val, "*tampadora*")
-        self.assertEqual(by_column[2].filters.filter, ["06h - 07h"])
-        self.assertEqual(by_column[0].customFilters.customFilter[0].val, "46023")  # 01/01/2026
+    def test_four_columns_one_row_per_occurrence(self):
+        found = summarize(self.headers, self.rows, text_col="Principais perdas",
+                          only_with_text=True)["matched"]
+        sheet = self.written(found)
+        self.assertEqual(sheet[0], ["Linha", "Data", "Hora", "Ocorrência"])
+        self.assertEqual(len(sheet), 4)  # cabeçalho + as 3 que têm texto
+        self.assertEqual(sheet[3][1:3], [datetime(2026, 3, 5), "06h - 07h"])  # data em texto vira data
 
-    def test_header_row_is_never_hidden(self):
-        _, _, _, sheet = self.run_export(terms=["xyz"])
-        self.assertFalse(sheet.row_dimensions[1].hidden)
-        self.assertEqual(sheet["A1"].value, "Data")
+    def test_keyword_keeps_only_its_sentence(self):
+        cell = [(2, [date(2026, 1, 1), 1, "06h - 07h", 1, 1, 0, 0,
+                     "Gasser parou. Tampadora travou no mandril.", None])]
+        self.assertEqual(self.written(cell, ["tampadora"])[1][3], "Tampadora travou no mandril.")
 
-    def test_source_untouched_and_rest_of_the_package_copied_byte_for_byte(self):
-        before = self.src.read_bytes()
-        self.run_export(hour="07h - 08h")
-        self.assertEqual(self.src.read_bytes(), before)
-        with zipfile.ZipFile(self.src) as a, zipfile.ZipFile(self.dst) as b:
-            self.assertEqual(a.namelist(), b.namelist())
-            self.assertEqual([n for n in a.namelist() if a.read(n) != b.read(n)],
-                             ["xl/worksheets/sheet1.xml"])
-
-    def test_more_than_two_terms_hides_right_but_says_so(self):
-        visible, exact, _, sheet = self.run_export(terms=["monobloco", "gasser", "tampadora"])
-        self.assertEqual((visible, exact), (3, False))
-        self.assertEqual(sheet.auto_filter.filterColumn, [])
-
-    def test_destination_cannot_be_the_source(self):
-        with self.assertRaises(ValueError):
-            export(self.src, self.src, "Dados", self.headers, self.rows,
-                   hour_col="Horário", hour="06h - 07h")
+    def test_a_column_the_sheet_lacks_comes_out_blank(self):
+        self.assertIsNone(self.written(self.rows[:1])[1][0])  # esta planilha não tem Linha
 
 
 if __name__ == "__main__":
@@ -345,14 +325,12 @@ class MergedOccurrences(unittest.TestCase):
         self.assertEqual(first[headers.index("Período")], "06h - 10h")  # 4 horas mescladas
         self.assertEqual(first[headers.index("Horas")].count("|"), 3)
 
-    def test_filtering_by_an_hour_inside_the_span_finds_the_occurrence(self):
-        for hour in ("06h - 07h", "08h - 09h", "09h - 10h"):
-            result = summarize(self.data["headers"], self.data["rows"], only_with_text=True,
-                               text_col="Principais perdas", hour_col="Horas", hour=hour)
-            self.assertEqual(result["found"], 7, f"hora {hour}")  # uma por dia
-        outside = summarize(self.data["headers"], self.data["rows"], only_with_text=True,
-                            text_col="Principais perdas", hour_col="Horas", hour="12h - 13h")
-        self.assertEqual(outside["found"], 0)
+    def test_filtering_by_shift_keeps_a_merged_occurrence_whole(self):
+        def found(shift):
+            return summarize(self.data["headers"], self.data["rows"], only_with_text=True,
+                             text_col="Principais perdas", hour_col="Horas", shift=shift)["found"]
+        self.assertEqual(found(1), 14)  # duas por dia, as duas no 1º turno
+        self.assertEqual(found(2), 0)
 
     def test_hours_not_covered_keep_their_own_row_for_the_totals(self):
         self.assertEqual(len(self.data["rows"]), 7 * 8)  # 7 dias x 8 horas do 1º turno
