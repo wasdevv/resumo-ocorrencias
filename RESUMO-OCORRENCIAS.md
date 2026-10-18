@@ -14,7 +14,7 @@ máquina de quem usa). Código em inglês, tela em português.
 ```bash
 pip install -r requirements.txt
 python excel_filter.py            # abre a tela
-python -m unittest discover -s .  # 125 testes
+python -m unittest discover -s .  # 161 testes
 ```
 
 No Linux o Tkinter vem separado: `sudo apt install python3-tk`. No Windows já vem
@@ -23,8 +23,12 @@ com o instalador do python.org.
 Para gerar o `.exe`:
 
 ```bash
-python -m PyInstaller --onefile --windowed --name "Resumo de Ocorrencias" excel_filter.py
+python -m PyInstaller --onefile --windowed --name "Resumo de Ocorrencias" \
+    --add-data "admin.json:." excel_filter.py
 ```
+
+Sem o `admin.json` ao lado do script, o `.exe` sai sem admin: o login responde
+que não há admin configurado.
 
 O título da janela carrega o carimbo do build (`build 15/09 01:18`) — é como se
 sabe qual versão está rodando.
@@ -51,6 +55,12 @@ escolhido; sem item escolhido, limpa tudo.
 
 ## 3. A tela
 
+O app inteiro é escuro. No topo, o botão **Unilever** e, para o admin, Abrir,
++ Adicionar, API e o histórico; embaixo, um painel com os filtros numa linha só — datas, turno,
+linhas, palavra-chave — e Filtrar / Baixar Dados à direita.
+Abaixo dos filtros, o título **Oráculo Digital** com o subtítulo "enxergando
+oportunidades" e, sob eles, o período filtrado.
+
 O app abre na aba **Produção**; Ocorrências é a segunda. Acima das abas fica só
 o período filtrado ("05/01/2026 a 31/08/2026").
 
@@ -72,21 +82,70 @@ Filtros: **data inicial / data final**, **turno** (1º 06h–14h, 2º 14h–22h,
 
 Os mesmos filtros, vistos como números:
 
-- **Tiles**: planejado, produzido, faltou, % atingido, linhas de ocorrência.
-- **Produzido**: barra = produzido, **linha azul = planejado**; verde bateu o
-  plano, vermelho ficou abaixo, **cinza = plano não anotado**. A granularidade se
-  ajusta sozinha: um dia → por hora; até 120 barras → por hora ao longo dos dias;
-  até 31 dias → por dia; acima disso → por mês. **Clicar numa barra abre o nível
-  de baixo** (mês → dias → horas).
-- **Tempo de troca (changeover)** por dia ou mês, com o total no título.
-- **Ocorrências por equipamento**: cada linha do relato começa com a máquina
-  ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca; **clicar leva
-  para as ocorrências daquele equipamento**, já filtradas.
-- **SKU e changeover por dia**: o SKU inicial do dia e, a cada troca, "houve um
-  changeover 08h - 09h (31m19s) · passa a 64830874". Com três trocas, chega ao
-  terceiro SKU.
+- **Tiles**: planejado, produzido, faltou (laranja quando falta), % atingido,
+  linhas de ocorrência.
+- **Ocorrências por equipamento**, logo abaixo dos tiles: cada linha do relato
+  começa com a máquina ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca;
+  **clicar leva para as ocorrências daquele equipamento**, já filtradas.
+- **Tempo de troca (changeover) e produção por dia**, num gráfico só: em cima,
+  as barras de minutos de changeover; embaixo, numa faixa, a produção do dia —
+  azul bateu o plano, laranja ficou abaixo, ardósia sem plano anotado — com a
+  marca branca no plano. Acima de 31 dias o eixo vira mês. **Clicar num dia** o
+  destaca e leva o painel do lado até ele; **duplo clique** filtra só aquele dia.
+- **SKU e changeover por dia**, lado a lado com o gráfico: o SKU inicial do dia
+  e, a cada troca, "houve um changeover 08h - 09h (31m19s) · passa a 64830874".
+  Com três trocas, chega ao terceiro SKU.
 
-Passar o mouse em qualquer barra mostra os números exatos.
+Passar o mouse num dia mostra changeover, produzido, plano e % exatos. A janela
+abre maximizada.
+
+### Unilever, Deslogar e Adicionar API (acesso e base salva)
+
+Quem abre o app é **leitor**: vê o botão **Unilever**, os filtros, as abas e o
+Baixar Dados, com a **base salva** já carregada. Unilever abre o login; com a
+conta de admin, o mesmo botão vira **Deslogar** e aparecem **Abrir**,
+**+ Adicionar**, o histórico e, ao lado do Deslogar, **Adicionar API**. O login
+não fica lembrado: cada vez que o app abre, começa como leitor.
+
+**Adicionar API** tem duas abas:
+
+- **Fontes em tempo real** — **Enviar .zip...** importa uma vez. O **token /
+  código** é o token de acesso do Microsoft Graph (o do Graph Explorer serve).
+  Cada **fonte** é um nome (ex.: outubro, 2026, Linha 1) e uma **chave**:
+  `drives/<id>/items/<id>` de um **arquivo ou de uma pasta** — a do ano ou a do
+  mês; o app percorre ANO → MÊS → ARQUIVO, pega só `.xlsx`/`.zip` (ignora o `~$`
+  de trava) e tira o mês dos nomes das pastas ("2026" / "10 - Outubro") —, a URL
+  completa do Graph com ela (`/content` e `/children` também servem), o link do
+  SharePoint, ou o arquivo/pasta que o OneDrive sincroniza. **Testar conexão** só
+  lê: diz se o token e a chave abrem o arquivo ou a pasta e quais planilhas e
+  meses estão lá, sem baixar nem salvar nada. Enquanto o app está aberto, ele confere cada fonte **a cada minuto**
+  e só baixa quando o arquivo mudou (o `cTag` do Graph, o ETag do link, ou a data
+  e o tamanho do arquivo sincronizado). Mudou — "Ricardo trocou x por z" — a base
+  é atualizada e a tela se refaz **mantendo os filtros** de quem está olhando, com
+  "Atualizado às 14:32: outubro (modificado por Ricardo)" na barra de status.
+- **Na base** — uma linha por planilha (linha de produção, mês, linhas, origem,
+  quando entrou); marque várias e **Apagar selecionados**, com confirmação.
+
+A mesma linha no mesmo mês **substitui** a anterior: reenviar o zip, mesmo salvo
+como "(1)", ou o mesmo mês chegar de novo pela fonte, não dobra nenhum total.
+
+Tudo fica em `~/.resumo-ocorrencias/base/` (no Windows,
+`C:\Users\<usuário>\.resumo-ocorrencias\base`): um índice e um arquivo por
+planilha, já lidos — abrir o app não relê os zips — e `fontes.json` com as fontes
+e o token. Fechar o app não apaga nada; só o admin apaga.
+
+O app **só lê** do SharePoint — todo pedido é GET: descrever o arquivo, listar a
+pasta, baixar. Nada é alterado nem apagado lá; Apagar e Remover fonte mexem só
+na cópia do app. Pelo Graph, o token vai só nos pedidos ao Graph; o download usa
+o endereço pré-assinado que o Graph devolve, sem token (como a documentação
+manda), e a lista de uma pasta só segue a próxima página se ela for no Graph.
+Um token vencido aparece como "O token expirou" na fonte, uma vez, e as outras
+fontes continuam.
+
+A senha nunca é gravada: `admin.json` guarda o login, um sal e o hash PBKDF2. O
+arquivo fica **fora do git** (o repositório é público) e entra no `.exe` na hora
+do build. Para criar ou trocar: `python excel_filter.py --admin <login>` pede a
+senha duas vezes e grava o `admin.json` ao lado do script.
 
 ### Baixar Dados
 
@@ -190,22 +249,38 @@ campos travados enquanto lê. A janela não congela mais.
 ## 7. Limites conhecidos
 
 - Só `.xlsx`; `.xls` e macros de `.xlsm` não passam pelo openpyxl.
-- Mais de 2 palavras-chave: as linhas certas somem, mas o Excel só aceita 2
-  critérios por coluna e o dropdown do arquivo exportado abre sem o critério.
 - `Seladora` e `Seladora de Caixas` contam separado, porque é assim que está
   escrito no relatório. Unificar exigiria um dicionário de apelidos de máquina.
 - O plano é lido como está escrito; o app **não** recalcula a partir da tabela de
   formatos (a aba Planejamento tem três blocos com valores diferentes para o
   mesmo formato e nada diz qual vale quando).
-- O visual é o Tkinter cru, ainda sem o acabamento de cartões/paleta.
+- O login de admin é uma porta na tela, não segurança: quem desempacotar o
+  `.exe` passa por ela, e a base é JSON comum no disco. Proteção de verdade pede
+  um servidor decidindo quem escreve.
+- A base é **deste computador**. Em outro PC o mesmo `.exe` começa com a base
+  vazia.
+- O token do Graph colado à mão vale cerca de **1 hora**; depois a fonte para com
+  "O token expirou". Tempo real por meses sem ninguém colar token exige registrar
+  o app no Azure AD da empresa (TI), para ele renovar o acesso sozinho — ou usar
+  como chave o arquivo de uma pasta que o OneDrive sincroniza, que não precisa de
+  token nenhum.
+- "Tempo real" é conferir a cada minuto com o app aberto: um app de desktop não
+  recebe aviso do SharePoint (webhook pede endereço público).
+- O token fica em texto puro em `fontes.json`, na pasta do usuário.
+- O comportamento do Graph foi testado contra um servidor local escrito a partir
+  da documentação da Microsoft, não contra o SharePoint da Unilever.
 
 ---
 
 ## 8. Testes
 
-125 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
+161 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
 e das versões do modelo, mês de referência e conflitos, células mescladas, filtro
-por palavra/período/hora/linha, junção de pacotes, histórico, totais e
+por palavra/período/turno/linha, junção de pacotes, histórico, totais e
 desconhecidos, tempo de troca, sequência de SKU, gráficos (contando os retângulos
-desenhados num Tk de verdade), chips, máscara de data, e a equivalência entre o
-leitor rápido e o lento.
+desenhados num Tk de verdade), chips, máscara de data, a equivalência entre o
+leitor rápido e o lento, o login de admin, a base salva (ida e volta, reenvio sem
+duplicar, apagar, índice adulterado) e as fontes em tempo real — link com ETag e
+304, Graph com o token só nos metadados e o `u!` do exemplo da documentação,
+arquivo sincronizado, fonte quebrada que não para as outras — contra servidores
+HTTP locais de verdade.

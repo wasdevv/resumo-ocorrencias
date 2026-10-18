@@ -3,14 +3,24 @@
 Code is English, the UI is pt-BR on purpose. Run with: python excel_filter.py
 """
 
+import base64
 import io
 import json
 import queue
 import calendar
+import hashlib
+import hmac
 import posixpath
 import re
+import secrets
+import shutil
+import sys
+import tempfile
 import threading
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
@@ -18,10 +28,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "17/10 23:41"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 02:42"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -121,6 +130,9 @@ SHIFT_FIELD_NAMES = {"horario": "horário", "formato": "formato", "plan": "plan"
                      "produzido": "produzido", "apontado": "apontado",
                      "perdas": "principais perdas"}
 SHIFT_HOURS = 8  # each shift block lists eight hours
+# where the screen finds each thing in a dataset built from the day sheets
+SHIFT_COLUMNS = {"date": "Data", "hour": "Horas", "label": "Período", "text": "Principais perdas",
+                 "line": "Linha"}
 
 
 class _Cell:
@@ -495,6 +507,646 @@ def forget_all():
     return []
 
 
+# --- Admin access ----------------------------------------------------------------
+ADMIN_ROUNDS = 200_000
+
+
+def admin_file():
+    """admin.json: bundled into the .exe at build time, next to the script from source.
+
+    Never committed — the repository is public, and even a salted hash of a
+    short password is crackable once it is on display.
+    """
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "admin.json"
+
+
+def make_admin(user, password, path=None):
+    """Write the admin's login with a salted PBKDF2 hash; the password is never stored."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ADMIN_ROUNDS)
+    target = Path(path or admin_file())
+    target.write_text(json.dumps({"user": user.strip(), "salt": salt.hex(), "hash": digest.hex(),
+                                  "rounds": ADMIN_ROUNDS}), encoding="utf-8")
+    return target
+
+
+def is_admin(user, password, path=None):
+    """Whether this login and password are the admin's. No admin file means no admin.
+
+    ponytail: a check inside a desktop .exe keeps the admin buttons away from the
+    floor; it does not stop someone who unpacks the .exe. Real protection is a
+    server deciding who may write the base.
+    """
+    try:
+        saved = json.loads(Path(path or admin_file()).read_text(encoding="utf-8"))
+        salt, expected = bytes.fromhex(saved["salt"]), bytes.fromhex(saved["hash"])
+        rounds, known = int(saved["rounds"]), str(saved["user"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    typed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, rounds)
+    return hmac.compare_digest(typed, expected) and user.strip().casefold() == known.casefold()
+
+
+# --- Saved base: what the admin fed, kept until the admin deletes it --------------
+BASE_DIR = HISTORY_FILE.parent / "base"
+STORE_LOCK = threading.RLock()  # the polling thread and the screen both write here
+ENTRY_ID = re.compile(r"[0-9a-f]{16}")
+
+
+def _encode(value):
+    """A cell as JSON: dates travel tagged and come back as dates."""
+    if isinstance(value, datetime):
+        return {"$dt": value.isoformat()}
+    if isinstance(value, date):
+        return {"$d": value.isoformat()}
+    return str(value)  # a time or anything exotic keeps its text, never turns into nothing
+
+
+def _decode(obj):
+    if "$dt" in obj:
+        return datetime.fromisoformat(obj["$dt"])
+    if "$d" in obj:
+        return date.fromisoformat(obj["$d"])
+    return obj
+
+
+def _write_json(path, payload):
+    """Write through a temp file, so a crash mid-write never leaves half a file."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, default=_encode, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def base_entries(folder=None):
+    """One entry per saved workbook. A missing or broken index is an empty base.
+
+    Ids are checked before anything uses them as a file name: an edited index
+    must not be able to point outside the folder.
+    """
+    try:
+        saved = json.loads((Path(folder or BASE_DIR) / "indice.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(saved, list):
+        return []
+    return [e for e in saved if isinstance(e, dict) and e.get("key")
+            and ENTRY_ID.fullmatch(str(e.get("id", "")))]
+
+
+def _workbook_key(headers, rows, name):
+    """(key, line, (year, month)) of a workbook, read from its rows: one line in one month.
+
+    The file name is not the identity — a browser saves the same zip again as
+    "(1)", and the same month sent again has to replace the old one, not double
+    every total. Only a workbook whose line was never written falls back to it.
+    """
+    line_at, date_at = _at(headers, "Linha"), _at(headers, "Data")
+    lines = Counter(str(v[line_at]) for _, v in rows
+                    if line_at is not None and v[line_at] not in (None, "", "—"))
+    months = Counter((d.year, d.month) for d in
+                     (parse_date(v[date_at]) for _, v in rows if date_at is not None) if d)
+    line = lines.most_common(1)[0][0] if lines else ""
+    month = months.most_common(1)[0][0] if months else None
+    when = f"{month[0]}-{month[1]:02d}" if month else "?"
+    return f"{line or name}|{when}", line, month
+
+
+def base_add(data, origin, folder=None):
+    """Save every workbook of a loaded dataset into the base. (saved, replaced) file names.
+
+    The same line and month replaces what was there. Only shift reports with a
+    month that was read go in: the base is one table, and a guessed month would
+    file a whole month of production under the wrong date for good.
+    """
+    if data.get("kind") != "turno":
+        raise ValueError("Só relatório de turno entra na base.")
+    if data.get("month_guessed"):
+        raise ValueError("Nenhuma aba diz o mês desta planilha — envie dentro do zip, com o mês"
+                         " no nome do arquivo.")
+    folder = Path(folder or BASE_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    headers, file_at = data["headers"], _at(data["headers"], "Arquivo")
+    parts = {}
+    for number, values in data["rows"]:
+        name = values[file_at] if file_at is not None else origin
+        parts.setdefault(str(name), []).append((number, values))
+    with STORE_LOCK:
+        entries, stale, saved, replaced = base_entries(folder), [], [], []
+        for name, rows in parts.items():
+            key, line, month = _workbook_key(headers, rows, name)
+            for old in [e for e in entries if e["key"] == key]:
+                entries.remove(old)
+                stale.append(old["id"])
+                replaced.append(old.get("file", ""))
+            entry = {"id": secrets.token_hex(8), "key": key, "file": name, "line": line,
+                     "month": list(month) if month else None, "rows": len(rows),
+                     "origin": origin, "added": datetime.now().isoformat(timespec="seconds")}
+            _write_json(folder / f"{entry['id']}.json",
+                        {"headers": headers, "rows": [values for _, values in rows]})
+            entries.append(entry)
+            saved.append(name)
+        _write_json(folder / "indice.json", entries)  # new files exist before the index says so
+        for gone in stale:  # and the old ones go only after the index stopped pointing at them
+            (folder / f"{gone}.json").unlink(missing_ok=True)
+    return saved, replaced
+
+
+def base_remove(ids, folder=None):
+    """Take workbooks out of the base for good; give back what is left."""
+    folder = Path(folder or BASE_DIR)
+    gone = {i for i in ids if ENTRY_ID.fullmatch(str(i))}
+    with STORE_LOCK:
+        kept = [e for e in base_entries(folder) if e["id"] not in gone]
+        if folder.exists():
+            _write_json(folder / "indice.json", kept)
+        for i in gone:
+            (folder / f"{i}.json").unlink(missing_ok=True)
+    return kept
+
+
+def base_load(folder=None):
+    """The saved base as one dataset for the screen, or None when it is empty.
+
+    A workbook whose file is gone or unreadable is listed in "missing", so the
+    screen can say it instead of showing smaller totals as if they were whole.
+    """
+    folder = Path(folder or BASE_DIR)
+    entries = sorted(base_entries(folder),
+                     key=lambda e: (str(e.get("line") or ""), e.get("month") or [0, 0]))
+    headers, rows, months, missing = None, [], [], []
+    for entry in entries:
+        try:
+            saved = json.loads((folder / f"{entry['id']}.json").read_text(encoding="utf-8"),
+                               object_hook=_decode)
+            part_headers, part_rows = saved["headers"], saved["rows"]
+        except (OSError, ValueError, KeyError, TypeError):
+            missing.append(entry.get("file", entry["id"]))
+            continue
+        if headers is None:
+            headers = part_headers
+        elif part_headers != headers:
+            missing.append(entry.get("file", entry["id"]))
+            continue
+        rows.extend((len(rows) + i, values) for i, values in enumerate(part_rows, 1))
+        month = tuple(entry["month"]) if entry.get("month") else None
+        months.append((entry.get("file", ""), month, "base salva"))
+    if not rows:
+        return {"missing": missing} if missing else None
+    read_months = [when for _, when, _ in months if when]
+    return {"kind": "turno", "sheet": "base salva", "headers": headers, "rows": rows,
+            "path": "", "month": min(read_months) if read_months else None, "month_from": None,
+            "month_guessed": False, "months": months, "base": True, "missing": missing,
+            "columns": dict(SHIFT_COLUMNS)}
+
+
+# --- Feeding from SharePoint: Graph, a plain link, or a folder OneDrive keeps in sync --
+LOGIN_WALL = ("O link não devolveu um .zip nem um .xlsx — o SharePoint pediu login. Cole o token"
+              " do Graph em Adicionar API, use um link que baixe sem login, ou Enviar .zip.")
+GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_HOST = "https://graph.microsoft.com/"
+SPREADSHEETS = (".xlsx", ".zip")
+WALK_LIMIT = 400  # files: a key at the root of a whole library would pull all of it
+GRAPH_PATHS = ("drives/", "sites/", "me/drive/")
+GRAPH_ERRORS = {401: "O token expirou ou não vale — cole um novo em Adicionar API.",
+                403: "O token não dá acesso a esse arquivo.",
+                404: "Nenhum arquivo com essa chave no SharePoint."}
+SOURCES_FILE = "fontes.json"
+SYNC_EVERY_MS = 60_000  # a minute: fresh enough for a shift report, one light call per file
+
+
+def direct_link(url):
+    """A SharePoint share link answers with a page; download=1 asks for the file itself."""
+    parts = urllib.parse.urlsplit(url.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("O link precisa começar com https://")
+    if parts.hostname.endswith(".sharepoint.com"):
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if not any(name == "download" for name, _ in query):
+            query.append(("download", "1"))
+        parts = parts._replace(query=urllib.parse.urlencode(query))
+    return urllib.parse.urlunsplit(parts)
+
+
+def share_id(link):
+    """Graph's id for a sharing link: "u!" + the link in unpadded base64url (Graph docs)."""
+    return "u!" + base64.urlsafe_b64encode(link.strip().encode()).decode().rstrip("=")
+
+
+def graph_key(key):
+    """The drives/... path inside whatever was pasted: a bare key, or a full Graph URL
+    ending in /content or /children — the forms Graph Explorer and Copilot hand out."""
+    key = key.strip()
+    if key[:4].upper() == "GET ":
+        key = key[4:].strip()
+    if key.startswith(GRAPH_HOST):
+        key = key[len(GRAPH_HOST):].split("?", 1)[0]
+        key = key.split("/", 1)[1] if key.startswith(("v1.0/", "beta/")) else key
+    for tail in ("/content", "/children"):
+        if key.endswith(tail):
+            key = key[:-len(tail)]
+    return key.lstrip("/")
+
+
+def graph_item_url(key):
+    """Where Graph describes what a key points to: a drives/... path or a SharePoint link."""
+    path = graph_key(key)
+    if path.startswith(GRAPH_PATHS):
+        return f"{GRAPH}/{path}"
+    if key.strip().startswith(("http://", "https://")):
+        return f"{GRAPH}/shares/{share_id(key)}/driveItem"
+    raise ValueError("Com o token, a chave é drives/<id>/items/<id> (ou a URL do Graph com ela),"
+                     " ou o link do arquivo no SharePoint.")
+
+
+def month_of(names):
+    """(year, month) that folder and file names say — "2026" / "10 - Outubro" — or None.
+
+    The deepest name naming a month wins; its year is the one in that same name
+    or the nearest one above it. Without both, the workbook's own sheets decide.
+    """
+    for i in range(len(names) - 1, -1, -1):
+        said = month_from_name(names[i])
+        if not said:
+            continue
+        year = said[0]
+        for above in reversed(names[:i + 1]):
+            if year:
+                break
+            found = re.search(r"\b(20\d{2})\b", str(above))
+            year = int(found.group(1)) if found else None
+        return (year, said[1]) if year else None
+    return None
+
+
+def _graph_json(url, token, timeout=30):
+    """The driveItem Graph describes, as a dict; every failure said in words."""
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.strip()}",
+                                                   "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            payload = json.loads(answer.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise ValueError(GRAPH_ERRORS.get(error.code, f"O Graph respondeu {error.code}.")) from error
+    except urllib.error.URLError as error:
+        raise ValueError(f"Não deu para falar com o Graph: {error.reason}") from error
+    except ValueError as error:
+        raise ValueError("O Graph respondeu algo que não é JSON.") from error
+    if not isinstance(payload, dict):  # "[]" and "7" parse as JSON too
+        raise ValueError("O Graph respondeu algo que não é a descrição de um arquivo.")
+    return payload
+
+
+def _open(request, timeout):
+    """urlopen with every failure said in words; None when the server answers 304."""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        if error.code == 304:
+            return None
+        raise ValueError(LOGIN_WALL if error.code in (401, 403)
+                         else f"O link respondeu {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise ValueError(f"Não deu para acessar o link: {error.reason}") from error
+
+
+def _save(request, folder, name=None, timeout=60):
+    """Stream a download into `folder`: (local .zip/.xlsx, {"etag", "modified"}), or
+    (None, {}) when the server answers 304 — nothing new since the version sent.
+
+    Streamed — a month of reports is hundreds of MB. A link that is not public
+    answers with a login page instead of the file: that is said, never handed to
+    the reader as if it were a spreadsheet.
+    """
+    partial = Path(folder) / "download.part"
+    answer = _open(request, timeout)
+    if answer is None:
+        return None, {}
+    with answer, open(partial, "wb") as out:
+        head = answer.read(4)
+        if head != b"PK\x03\x04":  # every .zip and .xlsx starts like this; a page does not
+            raise ValueError(LOGIN_WALL)
+        out.write(head)
+        while chunk := answer.read(1 << 20):
+            out.write(chunk)
+        tags = {"etag": answer.headers.get("ETag", ""),
+                "modified": answer.headers.get("Last-Modified", "")}
+        name = name or answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
+    try:
+        with zipfile.ZipFile(partial) as package:
+            workbook = "xl/workbook.xml" in package.namelist()
+    except zipfile.BadZipFile as error:
+        raise ValueError("O arquivo baixado veio quebrado.") from error
+    stem = re.sub(r'[<>:"/\\|?*]', "_", Path(urllib.parse.unquote(name or "")).stem) or "sharepoint"
+    return partial.replace(Path(folder) / (stem + (".xlsx" if workbook else ".zip"))), tags
+
+
+def _who(item):
+    """Who last changed a Graph item (lastModifiedBy.user.displayName), or ""."""
+    changed_by = item.get("lastModifiedBy")
+    user = changed_by.get("user") if isinstance(changed_by, dict) else None
+    return str(user.get("displayName") or "") if isinstance(user, dict) else ""
+
+
+def _graph_names(item):
+    """The folder names above a Graph item (parentReference.path, percent-encoded) + its own."""
+    path = str((item.get("parentReference") or {}).get("path") or "")
+    above = path.split("root:", 1)[1] if "root:" in path else ""
+    return [urllib.parse.unquote(part) for part in above.split("/") if part] + [str(item.get("name") or "")]
+
+
+def _graph_item_of(item):
+    reference = item.get("parentReference") or {}
+    if not reference.get("driveId") or not item.get("id"):
+        raise ValueError("O Graph não disse onde fica esse item (driveId).")
+    return f"{GRAPH}/drives/{reference['driveId']}/items/{item['id']}"
+
+
+def _graph_files(folder_item, token, names, timeout, depth=0, found=None):
+    """[(file item, names)] under a Graph folder — ANO → MÊS → ARQUIVO, four levels down.
+
+    Pages are followed through @odata.nextLink (200 items a page), but only on
+    the Graph host: the token never travels anywhere else.
+    """
+    found = [] if found is None else found
+    url = _graph_item_of(folder_item) + "/children"
+    while url:
+        if not url.startswith(GRAPH):
+            raise ValueError("O Graph mandou continuar a lista fora do Graph — parei.")
+        page = _graph_json(url, token, timeout)
+        children = page.get("value") if isinstance(page.get("value"), list) else []
+        for child in (c for c in children if isinstance(c, dict)):
+            name = str(child.get("name") or "")
+            if "folder" in child:
+                if depth < 3:
+                    _graph_files(child, token, names + [name], timeout, depth + 1, found)
+            elif name.lower().endswith(SPREADSHEETS) and not name.startswith("~$"):
+                found.append((child, names + [name]))
+        if len(found) > WALK_LIMIT:
+            raise ValueError(f"Mais de {WALK_LIMIT} planilhas embaixo dessa chave — use a pasta"
+                             " do ano ou do mês.")
+        url = page.get("@odata.nextLink")
+    return found
+
+
+def source_versions(source):
+    """{file id: version} a source was last seen at (builds before folders kept just one)."""
+    versions = source.get("versions")
+    if isinstance(versions, dict):
+        return {str(k): str(v) for k, v in versions.items()}
+    return {"": str(source["version"])} if source.get("version") else {}
+
+
+def check_source(source, token="", folder=None, timeout=60):
+    """What one live source holds now: [(file id, version, fetch or None, who, month, name)].
+
+    A file key gives one entry; a folder key — the year, or a month — is walked
+    down to its spreadsheets, ANO → MÊS → ARQUIVO, the month read from the folder
+    names ("2026" / "10 - Outubro") instead of guessed. `fetch` is there only for
+    files whose version moved — the content tag Graph gives (cTag), the ETag a
+    plain link answers with, or the time and size of a synced file — and it
+    downloads when called, so one bad file never stops its siblings.
+    """
+    key = str(source.get("key") or "").strip()
+    if not key:
+        raise ValueError("Fonte sem chave.")
+    known, folder = source_versions(source), Path(folder or tempfile.mkdtemp())
+    graph = graph_key(key).startswith(GRAPH_PATHS)
+    if not key.startswith(("http://", "https://")) and not graph:
+        return _check_local(Path(key), known)
+    if token.strip():
+        return _check_graph(key, token, known, folder, timeout)
+    if graph:
+        raise ValueError("Essa chave é do Graph (drives/...): cole o token em Adicionar API.")
+    return [_check_link(key, known.get("", ""), folder, timeout)]
+
+
+def _check_local(path, known):
+    """A file, or a folder, the OneDrive client keeps in sync: versions from time and size."""
+    if path.is_dir():
+        files = sorted(p for p in path.rglob("*") if p.is_file()
+                       and p.suffix.lower() in SPREADSHEETS and not p.name.startswith("~$"))
+        if len(files) > WALK_LIMIT:
+            raise ValueError(f"Mais de {WALK_LIMIT} planilhas nessa pasta — use a do ano ou a do mês.")
+    elif path.is_file():
+        files = [path]
+    else:
+        raise ValueError(f"Arquivo ou pasta não encontrado: {path}")
+    found = []
+    for file in files:
+        stat = file.stat()
+        version = f"arquivo:{stat.st_mtime_ns}:{stat.st_size}"
+        inside = file != path
+        fid = file.relative_to(path).as_posix() if inside else ""
+        # only the names from the key down (plus its parent, for the year): a folder
+        # of the user's — "Maio Silva" — must not pass for a month
+        names = ([path.parent.name, path.name, *file.relative_to(path).parts] if inside
+                 else list(file.parts[-4:]))
+        found.append((fid, version, (lambda f=file: f) if known.get(fid) != version else None,
+                      "", month_of(names), file.name))
+    return found
+
+
+def _check_graph(key, token, known, folder, timeout):
+    """Through Microsoft Graph: the token goes to Graph only, never to a download address."""
+    item = _graph_json(graph_item_url(key), token, timeout)
+    names = _graph_names(item)
+    if "folder" in item:
+        files = [(str(child.get("id") or child_names[-1]), child, child_names)
+                 for child, child_names in _graph_files(item, token, names, timeout)]
+    else:
+        files = [("", item, names)]
+
+    def downloader(child, target):
+        def fetch():
+            url = child.get("@microsoft.graph.downloadUrl")
+            if not url:  # a listing may leave it out: ask the item itself
+                url = _graph_json(_graph_item_of(child), token, timeout).get(
+                    "@microsoft.graph.downloadUrl")
+            if not url:
+                raise ValueError("O Graph não deu o endereço de download — é uma pasta?")
+            target.mkdir(parents=True, exist_ok=True)
+            # the download address is pre-signed: the token must not travel with it
+            return _save(urllib.request.Request(str(url)), target, child.get("name"), timeout)[0]
+        return fetch
+
+    found = []
+    for index, (fid, child, child_names) in enumerate(files):
+        version = "graph:" + str(child.get("cTag") or child.get("eTag")
+                                 or child.get("lastModifiedDateTime") or "")
+        fetch = downloader(child, folder / str(index)) if known.get(fid) != version else None
+        found.append((fid, version, fetch, _who(child), month_of(child_names),
+                      str(child.get("name") or "")))
+    return found
+
+
+def _check_link(key, known, folder, timeout):
+    """A plain link: asks with the version it has; the server's 304 means nothing new."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if known.startswith("etag:"):
+        headers["If-None-Match"] = known[len("etag:"):]
+    elif known.startswith("modificado:"):
+        headers["If-Modified-Since"] = known[len("modificado:"):]
+    path, tags = _save(urllib.request.Request(direct_link(key), headers=headers), folder,
+                       timeout=timeout)
+    if path is None:  # 304: the same version as last time
+        return "", known, None, "", None, key
+    if tags["etag"]:
+        version = "etag:" + tags["etag"]
+    elif tags["modified"]:
+        version = "modificado:" + tags["modified"]
+    else:  # a server that says nothing about versions: the content decides
+        with open(path, "rb") as content:
+            version = "sha256:" + hashlib.file_digest(content, "sha256").hexdigest()
+    if version == known:
+        path.unlink()
+        return "", known, None, "", None, path.name
+    return "", version, (lambda p=path: p), "", month_of([path.name]), path.name
+
+
+def _month_text(month):
+    return f"{month[1]:02d}/{month[0]}" if month else "mês pelo conteúdo da planilha"
+
+
+def probe_source(key, token="", timeout=30):
+    """What a key reaches, read only: [lines]. Nothing is downloaded or saved.
+
+    "Testar conexão" answers with this: whether the token and the key open the
+    file or the folder, and which spreadsheets and months are behind it — and
+    the base, the sources and SharePoint stay exactly as they were.
+    """
+    key = key.strip()
+    if not key:
+        raise ValueError("Cole a chave para testar.")
+    graph = graph_key(key).startswith(GRAPH_PATHS)
+    if not key.startswith(("http://", "https://")) and not graph:
+        entries = _check_local(Path(key), {})
+        return [f"Achei {len(entries)} planilha(s):"] + [
+            f"{name} · {_month_text(month)}" for _, _, _, _, month, name in entries]
+    if token.strip():
+        item = _graph_json(graph_item_url(key), token, timeout)
+        names = _graph_names(item)
+        if "folder" not in item:
+            return ["Conectou no arquivo {} · {} · modificado por {} em {}".format(
+                item.get("name"), _month_text(month_of(names)), _who(item) or "?",
+                str(item.get("lastModifiedDateTime") or "?")[:16].replace("T", " "))]
+        files = _graph_files(item, token, names, timeout)
+        return [f"Conectou na pasta {item.get('name')}: {len(files)} planilha(s)"] + [
+            "{} · {} · modificado por {}".format(child_names[-1], _month_text(month_of(child_names)),
+                                                 _who(child) or "?")
+            for child, child_names in files]
+    if graph:
+        raise ValueError("Essa chave é do Graph (drives/...): cole o token para testar.")
+    answer = _open(urllib.request.Request(direct_link(key), headers={"User-Agent": "Mozilla/5.0"}),
+                   timeout)
+    with answer:  # only the first bytes: enough to know it is a file, not a login page
+        if answer.read(4) != b"PK\x03\x04":
+            raise ValueError(LOGIN_WALL)
+        name = answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
+    return [f"O link entrega um .zip/.xlsx: {Path(urllib.parse.unquote(name)).name}"]
+
+
+def load_sources(folder=None):
+    """{"token", "sources"} that Adicionar API keeps. A missing or broken file is empty."""
+    try:
+        saved = json.loads((Path(folder or BASE_DIR) / SOURCES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    sources = saved.get("sources") if isinstance(saved.get("sources"), list) else []
+    return {"token": str(saved.get("token") or ""),
+            "sources": [s for s in sources if isinstance(s, dict) and s.get("key")
+                        and ENTRY_ID.fullmatch(str(s.get("id", "")))]}
+
+
+def _change_sources(change, folder=None):
+    """Read, change and write fontes.json under the store lock; the new state."""
+    folder = Path(folder or BASE_DIR)
+    with STORE_LOCK:
+        state = load_sources(folder)
+        change(state)
+        folder.mkdir(parents=True, exist_ok=True)
+        _write_json(folder / SOURCES_FILE, state)
+    return state
+
+
+def add_source(label, key, folder=None):
+    """Follow a file from now on; it is read on the next check."""
+    key = key.strip()
+    if not key:
+        raise ValueError("Cole a chave: o link do arquivo, um caminho drives/..., ou o arquivo"
+                         " da pasta que o OneDrive sincroniza.")
+    if key.startswith(("http://", "https://")):
+        direct_link(key)  # says what is wrong with the link before it is saved
+    entry = {"id": secrets.token_hex(8), "label": label.strip() or "fonte", "key": key,
+             "version": "", "checked": "", "changed": "", "by": "", "problem": ""}
+    return _change_sources(lambda state: state["sources"].append(entry), folder)
+
+
+def remove_source(source_id, folder=None):
+    """Stop following a file. What it already brought stays in the base."""
+    return _change_sources(lambda state: state.update(
+        sources=[s for s in state["sources"] if s["id"] != source_id]), folder)
+
+
+def set_token(token, folder=None):
+    return _change_sources(lambda state: state.update(token=token.strip()), folder)
+
+
+def sync_sources(folder=None):
+    """Check every live source once and feed the base with what changed: [(label, who)].
+
+    One broken source, or one broken file inside a folder, never stops the rest;
+    the problem stays on the source for the screen. A file's version only moves
+    after it was read, so one that could not be read is fetched again next round;
+    one the base refuses (not a shift report) waits until it changes.
+    """
+    state, results, updated = load_sources(folder), {}, []
+    for source in state["sources"]:
+        label, temp = source.get("label") or "fonte", tempfile.mkdtemp()
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            entries = check_source(source, state["token"], temp)
+        except Exception as error:  # the whole source failed: it keeps what it knew
+            results[source["id"]] = {"checked": now, "problem": str(error) or type(error).__name__}
+            shutil.rmtree(temp, ignore_errors=True)
+            continue
+        known, ignored = source_versions(source), dict(source.get("ignored") or {})
+        versions, problems, who_changed = {}, [], None
+        for fid, version, fetch, who, month, name in entries:
+            if fetch is None:
+                versions[fid] = version
+                continue
+            try:
+                data = load(fetch(), month)
+            except Exception as error:  # unreadable now — mid-upload, maybe: next round again
+                problems.append(f"{name}: {error}")
+                if fid in known:
+                    versions[fid] = known[fid]
+                continue
+            try:
+                base_add(data, f"{label} · {name}", folder)
+                ignored.pop(fid, None)
+                who_changed = who if who_changed is None or who else who_changed
+            except ValueError as error:  # read, but not for the base: wait for it to change
+                ignored[fid] = f"{name}: {error}"
+            versions[fid] = version
+        result = {"checked": now, "versions": versions, "files": len(entries),
+                  "ignored": {k: v for k, v in ignored.items() if k in versions},
+                  "problem": "; ".join(problems)}
+        if who_changed is not None:
+            result.update(changed=now, by=who_changed)
+            updated.append((label, who_changed))
+        shutil.rmtree(temp, ignore_errors=True)
+        results[source["id"]] = result
+
+    def merge(fresh):  # into the freshest file: a source added during the check survives
+        for source in fresh["sources"]:
+            source.update(results.get(source["id"], {}))
+
+    _change_sources(merge, folder)
+    return updated
+
+
 def load(path, month=None, progress=None):
     """Open the file once and give back everything the screen needs.
 
@@ -513,8 +1165,7 @@ def load(path, month=None, progress=None):
         return {"kind": "turno", "sheet": f"{len(parts)} planilhas do zip", "headers": headers,
                 "rows": rows, "month": min(read_months) if read_months else None,
                 "month_from": None, "month_guessed": False, "months": months, "path": str(path),
-                "columns": {"date": "Data", "hour": "Horas", "label": "Período",
-                            "text": "Principais perdas", "line": "Linha"}}
+                "columns": dict(SHIFT_COLUMNS)}
     book = load_workbook(path, data_only=True, read_only=True)
     try:
         if is_shift_report(book):
@@ -529,8 +1180,7 @@ def load(path, month=None, progress=None):
                     # no sheet named the month and nobody asked for one: it is a guess,
                     # and a guessed date must say so instead of passing for a read value
                     "month_guessed": not month and not found,
-                    "columns": {"date": "Data", "hour": "Horas", "label": "Período",
-                                "text": "Principais perdas", "line": "Linha"}}
+                    "columns": dict(SHIFT_COLUMNS)}
         book.close()  # the plain table reader needs random access, so it opens its own
         book = load_workbook(path, data_only=True)
         sheet, headers, rows = read(path, book=book)
@@ -1049,95 +1699,128 @@ def merge(datasets):
             "sources": sources}
 
 
-def draw_day_chart(canvas, days, over="#2e7d32", under="#c62828", target="#1565c0",
-                   unknown="#9aa7bd"):
-    """One bar per day: what was produced, against the planned line.
+# the whole app is dark, after the reference panel chosen for the Produção tab
+BOARD_COLOURS = {"bg": "#0b0d10", "card": "#16191e", "grid": "#272c34", "text": "#e8ebef",
+                 "muted": "#8b95a3", "hit": "#8ab8f0", "miss": "#c8601a", "plan": "#ffffff",
+                 "swap": "#7d8794", "unknown": "#4a5361", "select": "#22344a",
+                 "field": "#1f242b", "button": "#242a32", "accent": "#3d7bd9",
+                 "ok": "#5cd08a", "error": "#ff6b6b"}
 
-    Green when production reached the plan, red when it fell short, and a blue
-    line at the planned level — a bar taller than the line produced above plan.
+
+def chart_columns(numbers):
+    """([(day, changeover minutes, planned, produced)], monthly) on one shared axis.
+
+    More than 31 days goes monthly: a picket fence of bars reads as nothing.
+    """
+    monthly = len(numbers["dias"]) > 31
+    swaps = {}
+    for day, minutes in numbers["trocas_por_dia"]:
+        key = day.replace(day=1) if monthly else day
+        swaps[key] = swaps.get(key, 0) + minutes
+    made = numbers["meses"] if monthly else numbers["dias"]
+    return [(when, swaps.get(when, 0), planned, produced)
+            for when, planned, produced in made], monthly
+
+
+def _short(value):
+    """50000 -> "50 mil", 1123000 -> "1,1 mi": the way the axis reads aloud."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f} mi".replace(".", ",")
+    return f"{value / 1000:.0f} mil" if value >= 1000 else f"{value:.0f}"
+
+
+def _minutes(value):
+    """Axis label for changeover: minutes, or hours once minutes get long."""
+    return f"{value / 60:.0f} h" if value >= 600 else f"{value:.0f} min"
+
+
+def draw_combo_chart(canvas, columns, monthly=False, selected=None, colours=None):
+    """Changeover per day on top, production per day in a strip below, one axis.
+
+    The changeover is the headline: bars of minutes. Under it each day's
+    production is blue when it reached the plan, orange when it fell short and
+    slate when nobody wrote a plan down; the white tick is the plan. Every column
+    is tagged "slot<i>" so the mouse finds it; `selected` gets a highlight behind.
 
     ponytail: tk.Canvas instead of matplotlib, a dependency that triples the .exe
     to draw rectangles. Swap it the day these charts need axes, zoom or export.
     """
+    c = {**BOARD_COLOURS, **(colours or {})}
     canvas.delete("all")
-    width = max(canvas.winfo_width(), 200)
-    height = max(canvas.winfo_height(), 120)
-    if not days:
-        canvas.create_text(width / 2, height / 2, text="Sem dados no filtro", fill="#777")
+    width = max(canvas.winfo_width(), 300)
+    height = max(canvas.winfo_height(), 200)
+    if not columns:
+        canvas.create_text(width / 2, height / 2, text="Sem dados no filtro", fill=c["muted"])
         return
-    top, floor, left = 14, height - 22, 44
-    ceiling = max(max(planned or 0, produced) for _, planned, produced in days) or 1
-    step = (width - left - 10) / len(days)
-
-    def y_of(value):
-        return floor - (value / ceiling) * (floor - top)
-
-    for value in (0, ceiling / 2, ceiling):  # three reference lines, with their numbers
-        canvas.create_line(left, y_of(value), width - 8, y_of(value), fill="#e6e8ec")
-        canvas.create_text(left - 6, y_of(value), text=f"{value / 1000:.0f}k" if value else "0",
-                           anchor="e", fill="#777", font=("TkDefaultFont", 7))
-    # every label is the first of a month: this is a monthly series, not a daily one
-    month_series = all(hasattr(d, "day") and d.day == 1 for d, *_ in days) and len(days) > 1
-    previous = None
-    for i, (day, planned, produced) in enumerate(days):
-        x = left + i * step
-        if isinstance(day, tuple):  # (dia, hora): o dia só aparece quando vira
-            label, previous = (f"{day[0].day:02d}" if day[0] != previous else ""), day[0]
-            if label and i:
-                canvas.create_line(x, top, x, floor, fill="#e6e8ec")
-        elif hasattr(day, "day"):
-            label = f"{day.day:02d}" if not month_series else day.strftime("%m/%y")
+    small = ("TkDefaultFont", 8)
+    x = 60
+    for name, colour, line in (("Changeover", c["swap"], False), ("Bateu o plano", c["hit"], False),
+                               ("Abaixo do plano", c["miss"], False),
+                               ("Plano", c["plan"], True), ("Sem plano", c["unknown"], False)):
+        if line:
+            canvas.create_line(x, 13, x + 14, 13, fill=colour, width=3)
         else:
-            label = str(day).split("-")[0].strip()
-        wide = min(max(step * 0.62, 2), 54)
-        middle = x + (step - wide) / 2
-        paint = unknown if planned is None else (over if produced >= planned else under)
-        canvas.create_rectangle(middle, y_of(produced), middle + wide, floor,
-                                fill=paint, width=0, tags=("slot", f"slot{i}"))
-        if planned:
-            canvas.create_line(x + 1, y_of(planned), x + step - 1, y_of(planned),
-                               fill=target, width=3)
-        if label and len(days) <= 200:
-            canvas.create_text(x + step / 2, floor + 7, text=label, fill="#777",
-                               font=("TkDefaultFont", 7))
-        # invisible column so the whole slot answers the mouse, not only the bar
-        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="",
-                                tags=("slot", f"slot{i}"))
+            canvas.create_rectangle(x, 7, x + 12, 19, fill=colour, width=0)
+        x = canvas.bbox(canvas.create_text(x + 18, 13, text=name, anchor="w", fill=c["muted"],
+                                           font=small))[2] + 16
 
+    left, right, top = 60, width - 10, 36
+    floor = height - 22  # production floor; the day labels sit under it
+    swap_floor = top + (floor - top) * 0.6
+    strip_top = swap_floor + 26
+    step = (right - left) / len(columns)
+    swap_ceiling = max(minutes for _, minutes, _, _ in columns) or 1
+    made_ceiling = max(max(planned or 0, produced) for _, _, planned, produced in columns) or 1
 
-def draw_time_chart(canvas, series, colour="#8a5a00"):
-    """One bar per slot for a single number — here, minutes of changeover."""
-    canvas.delete("all")
-    width = max(canvas.winfo_width(), 200)
-    height = max(canvas.winfo_height(), 90)
-    if not series or not any(value for _, value in series):
-        canvas.create_text(width / 2, height / 2, text="Sem troca no filtro", fill="#777")
-        return
-    top, floor, left = 10, height - 18, 44
-    ceiling = max(value for _, value in series) or 1
-    step = (width - left - 10) / len(series)
-    for mark in (0, ceiling):
-        y = floor - (mark / ceiling) * (floor - top)
-        canvas.create_line(left, y, width - 8, y, fill="#e6e8ec")
-        canvas.create_text(left - 6, y, text=f"{mark:.0f}min", anchor="e", fill="#777",
-                           font=("TkDefaultFont", 7))
-    month_series = all(hasattr(label, "day") and label.day == 1 for label, _ in series) \
-        and len(series) > 1
-    for i, (label, value) in enumerate(series):
+    def y_swap(value):
+        return swap_floor - value / swap_ceiling * (swap_floor - top)
+
+    def y_made(value):
+        return floor - value / made_ceiling * (floor - strip_top)
+
+    if selected is not None and 0 <= selected < len(columns):
+        canvas.create_rectangle(left + selected * step, top - 6, left + (selected + 1) * step,
+                                height - 2, fill=c["select"], width=0)
+    for value in (0, swap_ceiling / 2, swap_ceiling):
+        canvas.create_line(left, y_swap(value), right, y_swap(value), fill=c["grid"], dash=(2, 3))
+        canvas.create_text(left - 6, y_swap(value), text=_minutes(value), anchor="e",
+                           fill=c["muted"], font=small)
+    canvas.create_text(left + 4, swap_floor + 13, anchor="w", fill=c["muted"],
+                       text="Produção por " + ("mês" if monthly else "dia"),
+                       font=("TkDefaultFont", 8, "bold"))
+    for value in (0, made_ceiling):
+        canvas.create_line(left, y_made(value), right, y_made(value), fill=c["grid"], dash=(2, 3))
+        canvas.create_text(left - 6, y_made(value), text=_short(value), anchor="e",
+                           fill=c["muted"], font=small)
+    every = max(1, int(-(-24 // step)))  # labels never collide, however many days
+    wide = min(max(step * 0.62, 2), 40)
+    for i, (when, minutes, planned, produced) in enumerate(columns):
         x = left + i * step
-        wide = min(max(step * 0.62, 2), 54)
-        y = floor - (value / ceiling) * (floor - top)
-        canvas.create_rectangle(x + (step - wide) / 2, y, x + (step - wide) / 2 + wide, floor,
-                                fill=colour, width=0, tags=("slot", f"slot{i}"))
-        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="",
-                                tags=("slot", f"slot{i}"))
-        if len(series) <= 31 and hasattr(label, "day"):
-            canvas.create_text(x + step / 2, floor + 7,
-                               text=label.strftime("%m/%y") if month_series else f"{label.day:02d}",
-                               fill="#777", font=("TkDefaultFont", 7))
+        middle = x + (step - wide) / 2
+        tags = ("slot", f"slot{i}")
+        if minutes:
+            canvas.create_rectangle(middle, y_swap(minutes), middle + wide, swap_floor,
+                                    fill=c["swap"], width=0, tags=tags)
+        if produced:
+            paint = (c["unknown"] if planned is None
+                     else c["hit"] if produced >= planned else c["miss"])
+            canvas.create_rectangle(middle, y_made(produced), middle + wide, floor,
+                                    fill=paint, width=0, tags=tags)
+        if planned:
+            canvas.create_line(x + 1, y_made(planned), x + step - 1, y_made(planned),
+                               fill=c["plan"], width=2, tags=tags)
+        if i % every == 0 or i == selected:
+            on = i == selected
+            canvas.create_text(x + step / 2, height - 11,
+                               text=when.strftime("%m/%y") if monthly else f"{when.day:02d}",
+                               fill=c["text"] if on else c["muted"],
+                               font=("TkDefaultFont", 8, "bold" if on else "normal"))
+        # invisible column so the whole day answers the mouse, not only the bars
+        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="", tags=tags)
 
 
-def draw_rank_chart(canvas, items, colour="#c62828", highlight=None):
+def draw_rank_chart(canvas, items, colour="#c62828", highlight=None, ink="black",
+                    quiet="#444", strong="#8e1b1b"):
     """Horizontal bars: how many times each machine shows up in the period.
 
     Each bar is tagged "bar<i>" so the screen can tell which machine the mouse is
@@ -1156,12 +1839,12 @@ def draw_rank_chart(canvas, items, colour="#c62828", highlight=None):
         tag = f"bar{i}"
         on = i == highlight
         canvas.create_text(label_width - 6, y, text=name[:26], anchor="e", tags=("bar", tag),
-                           font=("TkDefaultFont", 8, "bold" if on else "normal"))
+                           fill=ink, font=("TkDefaultFont", 8, "bold" if on else "normal"))
         long = (count / ceiling) * (width - label_width - 46)
         canvas.create_rectangle(label_width, y - step / 3, label_width + long, y + step / 3,
-                                fill="#8e1b1b" if on else colour, width=0, tags=("bar", tag))
+                                fill=strong if on else colour, width=0, tags=("bar", tag))
         canvas.create_text(label_width + long + 6, y, text=str(count), anchor="w",
-                           font=("TkDefaultFont", 8), fill="#444", tags=("bar", tag))
+                           font=("TkDefaultFont", 8), fill=quiet, tags=("bar", tag))
         # invisible strip so the whole row answers the mouse, not just the bar
         canvas.create_rectangle(0, y - step / 2, width, y + step / 2, outline="", fill="",
                                 tags=("bar", tag))
@@ -1206,16 +1889,20 @@ def draw_chips(frame, chosen, on_remove):
     for child in frame.winfo_children():
         child.destroy()
     if not chosen:
-        ttk.Label(frame, text="todas as linhas", foreground="#777").pack(side="left")
+        ttk.Label(frame, text="todas as linhas", foreground=BOARD_COLOURS["muted"],
+                  background=BOARD_COLOURS["card"]).pack(side="left")
         return []
     made = []
     for name in chosen:
-        chip = tk.Frame(frame, background="#dce6f5", padx=6, pady=1)
+        tone = BOARD_COLOURS["select"]
+        chip = tk.Frame(frame, background=tone, padx=8, pady=2)
         chip.pack(side="left", padx=(0, 4))
-        tk.Label(chip, text=name, background="#dce6f5").pack(side="left")
-        close = tk.Button(chip, text="✕", background="#dce6f5", activebackground="#c3d4ee",
+        tk.Label(chip, text=name, background=tone, foreground=BOARD_COLOURS["text"]).pack(side="left")
+        close = tk.Button(chip, text="✕", background=tone, activebackground=BOARD_COLOURS["grid"],
                           relief="flat", borderwidth=0, highlightthickness=0, padx=3, pady=0,
-                          cursor="hand2", foreground="#345", command=lambda n=name: on_remove(n))
+                          cursor="hand2", foreground=BOARD_COLOURS["muted"],
+                          activeforeground=BOARD_COLOURS["text"],
+                          command=lambda n=name: on_remove(n))
         close.pack(side="left")
         made.append(close)
     return made
@@ -1227,151 +1914,246 @@ def main(path=None):
 
     root = tk.Tk()
     root.title(f"Resumo de ocorrências — build {BUILD}")
-    # a readonly combobox paints its whole field with the selection colour once it
-    # has focus: white it out, or every picker looks like a blue block
+    dark = BOARD_COLOURS
+    root.configure(background=dark["bg"])
+    root.geometry("1280x900")
+    try:  # the board needs the room: open maximised where the platform knows how
+        root.state("zoomed")
+    except tk.TclError:
+        pass
     style = ttk.Style()
-    style.map("TCombobox", fieldbackground=[("readonly", "white")],
-              selectbackground=[("readonly", "white")], selectforeground=[("readonly", "black")])
-    root.geometry("1040x700")
+    style.theme_use("clam")  # the native themes ignore most colours; clam takes them all
+    style.configure(".", background=dark["bg"], foreground=dark["text"],
+                    fieldbackground=dark["field"], bordercolor=dark["grid"],
+                    lightcolor=dark["grid"], darkcolor=dark["grid"], troughcolor=dark["bg"],
+                    insertcolor=dark["text"], selectbackground=dark["select"],
+                    selectforeground=dark["text"], arrowcolor=dark["muted"],
+                    font=("TkDefaultFont", 10))
+    style.map(".", foreground=[("disabled", dark["muted"])],
+              fieldbackground=[("disabled", dark["card"])])
+    style.configure("Card.TFrame", background=dark["card"])
+    style.configure("Card.TLabel", background=dark["card"])
+    style.configure("Field.TLabel", background=dark["card"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9, "bold"))
+    style.configure("Hint.TLabel", background=dark["card"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9))
+    style.configure("File.TLabel", background=dark["card"], font=("TkDefaultFont", 12, "bold"))
+    style.configure("Period.TLabel", font=("TkDefaultFont", 12, "bold"))
+    style.configure("Brand.TLabel", font=("TkDefaultFont", 18, "bold"))
+    style.configure("Tagline.TLabel", foreground=dark["muted"], font=("TkDefaultFont", 10))
+    style.configure("TEntry", padding=(8, 6))
+    style.configure("TCombobox", padding=(8, 6))
+    # a readonly combobox paints its whole field with the selection colour once it
+    # has focus: keep it the field colour, or every picker looks like a blue block
+    style.map("TCombobox", fieldbackground=[("readonly", dark["field"]),
+                                            ("disabled", dark["card"])],
+              selectbackground=[("readonly", dark["field"])],
+              selectforeground=[("readonly", dark["text"])])
+    root.option_add("*TCombobox*Listbox.background", dark["field"])
+    root.option_add("*TCombobox*Listbox.foreground", dark["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", dark["select"])
+    root.option_add("*TCombobox*Listbox.selectForeground", dark["text"])
+    style.configure("TButton", background=dark["button"], padding=(12, 6), borderwidth=1,
+                    width=-8)
+    style.map("TButton", background=[("disabled", dark["card"]), ("active", dark["grid"])])
+    style.configure("Accent.TButton", background=dark["accent"], foreground="white",
+                    bordercolor=dark["accent"], font=("TkDefaultFont", 10, "bold"))
+    style.map("Accent.TButton", background=[("disabled", dark["card"]), ("active", "#5b93e6")])
+    style.configure("TNotebook", background=dark["bg"], borderwidth=0, bordercolor=dark["grid"],
+                    tabmargins=(0, 4, 0, 0))
+    style.configure("TNotebook.Tab", background=dark["bg"], foreground=dark["muted"],
+                    padding=(16, 8), borderwidth=0, font=("TkDefaultFont", 10, "bold"))
+    style.map("TNotebook.Tab", background=[("selected", dark["card"])],
+              foreground=[("selected", dark["text"])])
+    style.configure("TScrollbar", background=dark["button"], bordercolor=dark["bg"],
+                    arrowcolor=dark["muted"])
+    style.configure("Treeview", background=dark["field"], fieldbackground=dark["field"],
+                    foreground=dark["text"], rowheight=26, bordercolor=dark["grid"])
+    style.map("Treeview", background=[("selected", dark["select"])],
+              foreground=[("selected", dark["text"])])
+    style.configure("Treeview.Heading", background=dark["button"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9, "bold"), padding=(6, 4))
     book = {"path": "", "headers": [], "rows": [], "date": "", "hour": "", "text": "",
-            "whole": None, "lines": [], "chosen": []}
+            "whole": None, "lines": [], "chosen": [], "admin": None}
 
     source, detected = tk.StringVar(value="Nenhuma planilha aberta"), tk.StringVar()
     start_date, end_date, hour, keyword = (tk.StringVar() for _ in range(4))
-    recent = tk.StringVar()
-    status = tk.StringVar(value="Abra uma planilha, ou escolha uma do histórico.")
+    recent, who = tk.StringVar(), tk.StringVar()
+    status = tk.StringVar(value="Carregando a base salva...")
     summary = tk.StringVar(value="—")
 
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
+    def panel(parent):
+        """A card on the black background: one bordered block per job."""
+        box = tk.Frame(parent, background=dark["card"], padx=14, pady=12,
+                       highlightthickness=1, highlightbackground=dark["grid"])
+        return box
 
-    ttk.Button(top, text="Abrir...", command=lambda: open_file()).grid(row=0, column=0, sticky="w")
-    ttk.Button(top, text="+ Adicionar", command=lambda: open_file(add=True)).grid(
-        row=0, column=5, sticky="e")
-    ttk.Label(top, textvariable=source, font=("TkDefaultFont", 10, "bold")).grid(
-        row=0, column=1, columnspan=5, sticky="w", padx=8)
+    def field(parent, caption, widget, column, span=1, hint=None):
+        """Caption above the control, the way a form is read: label, then input."""
+        ttk.Label(parent, text=caption.upper(), style="Field.TLabel").grid(
+            row=0, column=column, columnspan=span, sticky="w", pady=(0, 4))
+        widget.grid(row=1, column=column, columnspan=span, sticky="we", padx=(0, 12))
+        if hint:
+            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+                row=2, column=column, columnspan=span, sticky="w", pady=(4, 0))
 
-    ttk.Label(top, text="Histórico").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    recent_box = ttk.Combobox(top, textvariable=recent, state="readonly", width=70)
-    recent_box.grid(row=1, column=1, columnspan=4, sticky="we", pady=(8, 0), padx=(0, 8))
-    reopen_bar = ttk.Frame(top)
-    reopen_bar.grid(row=1, column=5, pady=(8, 0), sticky="e")
-    ttk.Button(reopen_bar, text="Reabrir", command=lambda: reopen()).pack(side="left")
+    # the name of the app first, above everything else
+    ttk.Label(root, text="Oráculo Digital", style="Brand.TLabel",
+              padding=(14, 10, 14, 0)).pack(fill="x")
+    ttk.Label(root, text="enxergando oportunidades", style="Tagline.TLabel",
+              padding=(14, 0, 14, 0)).pack(fill="x")
+
+    # file bar: what is open, and — for the admin — how to open or feed something else
+    files = panel(root)
+    files.pack(fill="x", padx=10, pady=(10, 0))
+    file_side = ttk.Frame(files, style="Card.TFrame")
+    file_side.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 16))
+    file_buttons = ttk.Frame(file_side, style="Card.TFrame")
+    file_buttons.pack(anchor="w")
+    open_button = ttk.Button(file_buttons, text="Abrir...", style="Accent.TButton",
+                             command=lambda: open_file())
+    add_button = ttk.Button(file_buttons, text="+ Adicionar", command=lambda: open_file(add=True))
+    api_button = ttk.Button(file_buttons, text="Adicionar API", command=lambda: open_api())
+    login_button = ttk.Button(file_buttons, text="Unilever", command=lambda: toggle_login())
+    login_button.pack(side="left")
+    ttk.Label(file_side, textvariable=who, style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
+    ttk.Label(files, textvariable=source, style="File.TLabel").grid(row=0, column=1, sticky="w")
+    # what the app worked out on its own: without this the filters look like magic
+    ttk.Label(files, textvariable=detected, style="Hint.TLabel").grid(
+        row=1, column=1, columnspan=2, sticky="w")
+    files.columnconfigure(1, weight=1)
+    reopen_bar = ttk.Frame(files, style="Card.TFrame")
+    reopen_bar.grid(row=0, column=2, sticky="e", pady=(0, 4))
+    ttk.Label(reopen_bar, text="HISTÓRICO", style="Field.TLabel").pack(side="left", padx=(0, 8))
+    recent_box = ttk.Combobox(reopen_bar, textvariable=recent, state="readonly", width=26)
+    recent_box.pack(side="left")
+    ttk.Button(reopen_bar, text="Reabrir", command=lambda: reopen()).pack(side="left", padx=(8, 0))
     ttk.Button(reopen_bar, text="✕", width=3, command=lambda: drop_history()).pack(side="left",
                                                                                   padx=(4, 0))
 
-    # what the app worked out on its own: without this the filters look like magic
-    ttk.Label(top, textvariable=detected, foreground="#3a6ea5").grid(
-        row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
-
-    ttk.Label(top, text="Data inicial (dd/mm/aaaa)").grid(row=3, column=0, sticky="w", pady=(10, 0))
-    ttk.Label(top, text="Data final").grid(row=3, column=1, sticky="w", pady=(10, 0))
-    ttk.Label(top, text="Turno").grid(row=3, column=2, sticky="w", pady=(10, 0))
-
-    first = ttk.Entry(top, textvariable=start_date, width=16, state="disabled")
-    last = ttk.Entry(top, textvariable=end_date, width=16, state="disabled")
-    hour_box = ttk.Combobox(top, textvariable=hour, width=22, state="disabled",
+    # filters: one row of fields, the keyword under them, the actions on the right
+    filters_box = panel(root)
+    filters_box.pack(fill="x", padx=10, pady=(10, 0))
+    fields = ttk.Frame(filters_box, style="Card.TFrame")
+    fields.pack(side="left", fill="x", expand=True)
+    first = ttk.Entry(fields, textvariable=start_date, width=14, state="disabled")
+    last = ttk.Entry(fields, textvariable=end_date, width=14, state="disabled")
+    hour_box = ttk.Combobox(fields, textvariable=hour, width=24, state="disabled",
                             values=["todos"] + list(SHIFT_LABELS.values()))
-
-    first.grid(row=4, column=0, sticky="w", padx=(0, 8))
-    last.grid(row=4, column=1, sticky="w", padx=(0, 8))
-    hour_box.grid(row=4, column=2, sticky="w", padx=(0, 8))
-
-    ttk.Label(top, text="Linhas (nenhuma = todas)").grid(row=3, column=4, sticky="w", pady=(10, 0))
+    hour.set("todos")
     line_choice = tk.StringVar()
-    line_box = ttk.Combobox(top, textvariable=line_choice, state="disabled", width=18)
-    line_box.grid(row=4, column=4, sticky="w", padx=(0, 8))
-    chips = ttk.Frame(top)
-    chips.grid(row=5, column=4, sticky="w", pady=(4, 0))
-
-    ttk.Label(top, text="Palavra-chave").grid(row=5, column=0, sticky="w", pady=(10, 0))
-    words = ttk.Entry(top, textvariable=keyword, state="disabled")
-    words.grid(row=6, column=0, columnspan=5, sticky="we")
-    filter_button = ttk.Button(top, text="Filtrar", command=lambda: refresh(), state="disabled")
-    filter_button.grid(row=6, column=5, padx=(8, 0), sticky="we")
-    download_button = ttk.Button(top, text="Baixar Dados", command=lambda: download_file(),
+    line_box = ttk.Combobox(fields, textvariable=line_choice, state="disabled", width=16)
+    field(fields, "Data inicial", first, 0, hint="dd/mm/aaaa ou só o dia")
+    field(fields, "Data final", last, 1)
+    field(fields, "Turno", hour_box, 2)
+    field(fields, "Linhas", line_box, 3)
+    chips = ttk.Frame(fields, style="Card.TFrame")
+    chips.grid(row=2, column=3, sticky="w", pady=(4, 0))
+    words = ttk.Entry(fields, textvariable=keyword, state="disabled")
+    field(fields, "Palavra-chave", words, 4, hint="separe por vírgula para buscar qualquer uma"
+                                                   " · Enter filtra")
+    fields.columnconfigure(4, weight=1)
+    actions = ttk.Frame(filters_box, style="Card.TFrame")
+    actions.pack(side="right", padx=(4, 0))
+    filter_button = ttk.Button(actions, text="Filtrar", style="Accent.TButton",
+                               command=lambda: refresh(), state="disabled")
+    filter_button.pack(fill="x", pady=(0, 6))
+    download_button = ttk.Button(actions, text="Baixar Dados", command=lambda: download_file(),
                                  state="disabled")
-    download_button.grid(row=7, column=5, padx=(8, 0), pady=(4, 0), sticky="we")
-    top.columnconfigure(4, weight=1)
+    download_button.pack(fill="x")
 
-    headline = ttk.Label(root, textvariable=summary, padding=(12, 6),
-                         font=("TkDefaultFont", 10, "bold"))
+    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 10, 14, 2))
     headline.pack(fill="x")
     headline.bind("<Configure>", lambda e: headline.configure(wraplength=e.width - 24))
 
-    tabs = ttk.Notebook(root)
-    tabs.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+    tabs = ttk.Notebook(root)  # packed after the status line, so that line never gets cut
 
-    frame = ttk.Frame(tabs, padding=(6, 6, 6, 6))
+    frame = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.add(frame, text="  Ocorrências  ")
-    listing = tk.Text(frame, wrap="word", padx=10, pady=8, spacing3=4, state="disabled")
+    listing = tk.Text(frame, wrap="word", padx=16, pady=12, spacing3=4, state="disabled",
+                      background=dark["card"], foreground=dark["text"], relief="flat",
+                      highlightthickness=1, highlightbackground=dark["grid"],
+                      font=("TkDefaultFont", 10), cursor="arrow")
     bar = ttk.Scrollbar(frame, orient="vertical", command=listing.yview)
     listing.configure(yscrollcommand=bar.set)
     listing.pack(side="left", fill="both", expand=True)
     bar.pack(side="right", fill="y")
-    listing.tag_config("when", font=("TkDefaultFont", 10, "bold"), foreground="#1a4d80")
-    listing.tag_config("none", foreground="#777")
-    listing.tag_config("hit", background="#ffe680")
-    listing.tag_config("line", font=("TkDefaultFont", 11, "bold"), foreground="#123",
-                       spacing1=8, spacing3=6)
+    listing.tag_config("when", font=("TkDefaultFont", 10, "bold"), foreground=dark["hit"])
+    listing.tag_config("none", foreground=dark["muted"])
+    listing.tag_config("hit", background="#6b5310", foreground="#fff3c4")
+    listing.tag_config("line", font=("TkDefaultFont", 12, "bold"), foreground=dark["text"],
+                       spacing1=10, spacing3=6)
 
-    board = ttk.Frame(tabs, padding=(10, 8, 10, 8))
+    board = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.insert(0, board, text="  Produção  ")  # the main screen: it opens here
     tabs.select(board)
-    tiles = ttk.Frame(board)
+
+    def card(parent, title):
+        """Dark panel with a bold title, like the rest of the board."""
+        box = tk.Frame(parent, background=dark["card"], padx=14, pady=10,
+                       highlightthickness=1, highlightbackground=dark["grid"])
+        heading = tk.Label(box, background=dark["card"], foreground=dark["text"],
+                           font=("TkDefaultFont", 11, "bold"), anchor="w",
+                           **({"textvariable": title} if isinstance(title, tk.StringVar)
+                              else {"text": title}))
+        heading.pack(fill="x", pady=(0, 6))
+        return box
+
+    tiles = tk.Frame(board, background=dark["bg"])
     tiles.pack(fill="x")
     tile_values = {}
     for i, (key, caption) in enumerate((("plan", "Planejado"), ("produzido", "Produzido"),
                                         ("faltou", "Faltou"), ("atingido", "Atingido"),
                                         ("ocorrencias", "Linhas de ocorrência"))):
-        cell = tk.Frame(tiles, background="#eef1f6", padx=14, pady=8)
-        cell.grid(row=0, column=i, sticky="we", padx=(0, 6))
+        cell = tk.Frame(tiles, background=dark["card"], padx=14, pady=8,
+                        highlightthickness=1, highlightbackground=dark["grid"])
+        cell.grid(row=0, column=i, sticky="we", padx=(0 if i == 0 else 8, 0))
         tiles.columnconfigure(i, weight=1)
-        tile_values[key] = tk.Label(cell, text="—", background="#eef1f6",
-                                    font=("TkDefaultFont", 14, "bold"))
+        tk.Label(cell, text=caption, background=dark["card"],
+                 foreground=dark["muted"]).pack(anchor="w")
+        tile_values[key] = tk.Label(cell, text="—", background=dark["card"],
+                                    foreground=dark["text"], font=("TkDefaultFont", 15, "bold"))
         tile_values[key].pack(anchor="w")
-        tk.Label(cell, text=caption, background="#eef1f6", foreground="#666").pack(anchor="w")
 
-    board_title = tk.StringVar(value="Produzido por dia   (linha azul: planejado ·"
-                                     " verde bateu o plano · vermelho ficou abaixo)")
-    ttk.Label(board, textvariable=board_title, foreground="#444").pack(anchor="w", pady=(12, 2))
-    day_chart = tk.Canvas(board, height=170, background="white", highlightthickness=1,
-                          highlightbackground="#dfe3ea")
-    day_chart.pack(fill="x")
+    # machines first; under them the changeover chart and the SKU list side by side
+    rank_card = card(board, "Ocorrências por equipamento no período")
+    rank_card.pack(fill="x", pady=(10, 0))
+    rank_chart = tk.Canvas(rank_card, height=150, background=dark["card"], highlightthickness=0)
+    rank_chart.pack(fill="x")
 
-    swap_title = tk.StringVar(value="Tempo de troca (changeover) por dia")
-    ttk.Label(board, textvariable=swap_title, foreground="#444").pack(anchor="w", pady=(10, 2))
-    swap_chart = tk.Canvas(board, height=96, background="white", highlightthickness=1,
-                           highlightbackground="#dfe3ea")
-    swap_chart.pack(fill="x")
+    pair = tk.Frame(board, background=dark["bg"])
+    pair.pack(fill="both", expand=True, pady=(10, 0))
+    pair.columnconfigure(0, weight=1)
+    pair.rowconfigure(0, weight=1)
+    chart_title = tk.StringVar(value="Tempo de troca (changeover) e produção por dia")
+    chart_card = card(pair, chart_title)
+    chart_card.grid(row=0, column=0, sticky="nsew")
+    # the hint is packed first: on a short screen the chart shrinks, the hint stays
+    tk.Label(chart_card, background=dark["card"], foreground=dark["muted"], anchor="w",
+             text="Clique num dia para ver o SKU e as trocas dele ao lado · "
+                  "duplo clique filtra só esse dia").pack(side="bottom", fill="x", pady=(6, 0))
+    day_chart = tk.Canvas(chart_card, height=240, background=dark["card"], highlightthickness=0)
+    day_chart.pack(fill="both", expand=True)
 
-    middle = ttk.Frame(board)
-    middle.pack(fill="both", expand=True, pady=(12, 0))
-    left_side = ttk.Frame(middle)
-    left_side.pack(side="left", fill="both", expand=True)
-    ttk.Label(left_side, text="Ocorrências por equipamento no período",
-              foreground="#444").pack(anchor="w", pady=(0, 2))
-    rank_chart = tk.Canvas(left_side, background="white", highlightthickness=1,
-                           highlightbackground="#dfe3ea")
-    rank_chart.pack(fill="both", expand=True)
-
-    right_side = ttk.Frame(middle, width=430)
-    right_side.pack(side="right", fill="y", padx=(12, 0))
-    right_side.pack_propagate(False)
     sku_title = tk.StringVar(value="SKU e changeover por dia")
-    ttk.Label(right_side, textvariable=sku_title, foreground="#444").pack(anchor="w", pady=(0, 2))
-    sku_list = tk.Text(right_side, wrap="word", width=50, padx=8, pady=6, state="disabled",
-                       background="white", highlightthickness=1, highlightbackground="#dfe3ea")
+    sku_card = card(pair, sku_title)
+    sku_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    sku_list = tk.Text(sku_card, wrap="word", width=52, height=14, padx=4, pady=2,
+                       font=("TkDefaultFont", 9),
+                       state="disabled", background=dark["card"], foreground=dark["text"],
+                       relief="flat", highlightthickness=0, cursor="arrow")
     sku_list.pack(fill="both", expand=True)
-    sku_list.tag_config("day", font=("TkDefaultFont", 10, "bold"), spacing1=4)
-    sku_list.tag_config("code", font=("TkDefaultFont", 9, "bold"), foreground="#1a4d80")
-    sku_list.tag_config("swap", foreground="#8a5a00")
-    sku_list.tag_config("quiet", foreground="#888")
+    sku_list.tag_config("day", font=("TkDefaultFont", 10, "bold"), spacing1=6)
+    sku_list.tag_config("picked", background=dark["select"])
+    sku_list.tag_config("code", font=("TkDefaultFont", 9, "bold"), foreground=dark["hit"])
+    sku_list.tag_config("swap", foreground="#e0a060")
+    sku_list.tag_config("quiet", foreground=dark["muted"])
 
-    status_line = ttk.Label(root, textvariable=status, padding=(12, 4), foreground="#555")
-    status_line.pack(fill="x")
+    status_line = ttk.Label(root, textvariable=status, padding=(14, 6), foreground=dark["muted"])
+    status_line.pack(side="bottom", fill="x")
+    tabs.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
-    def say(message, tone="#555"):
+    def say(message, tone=BOARD_COLOURS["muted"]):
         status.set(message)
         status_line.configure(foreground=tone)
 
@@ -1404,10 +2186,10 @@ def main(path=None):
 
     def open_file(chosen=None, month=None, add=False):
         if book.get("reading"):
-            say("Espere a leitura em andamento terminar.", "#b00020")
+            say("Espere a leitura em andamento terminar.", dark["error"])
             return
         if add and not book["rows"]:
-            say("Abra o primeiro arquivo antes de adicionar outro.", "#b00020")
+            say("Abra o primeiro arquivo antes de adicionar outro.", dark["error"])
             return
         if not chosen:
             opened = Path(book["path"]).parent if book["path"] else start_dir()
@@ -1428,7 +2210,7 @@ def main(path=None):
                 return
             add = somar
         if not Path(chosen).exists():
-            say(f"{chosen} não está mais nesse caminho.", "#b00020")
+            say(f"{chosen} não está mais nesse caminho.", dark["error"])
             return
         source.set(f"Lendo {Path(chosen).name}...")
         say("Lendo em segundo plano — a janela continua respondendo.")
@@ -1462,7 +2244,7 @@ def main(path=None):
                 widget.state(["!disabled"])
             if kind == "erro":
                 source.set("Nenhuma planilha aberta")
-                say(f"Erro ao ler: {payload}", "#b00020")
+                say(f"Erro ao ler: {payload}", dark["error"])
                 return
             finish(payload)
 
@@ -1475,11 +2257,13 @@ def main(path=None):
             try:
                 data = merge([book["data"], data])
             except ValueError as error:
-                say(f"Erro ao juntar: {error}", "#b00020")
+                say(f"Erro ao juntar: {error}", dark["error"])
                 return
-        book["just_loaded"] = ("Somado ao que já estava aberto: {} arquivos.".format(
-            len(data.get("sources", []))) if add else "Abriu do zero — o que estava aberto"
-            " foi substituído. Use + Adicionar para somar.")
+        book["just_loaded"] = (
+            "Base salva: o que o admin alimentou pelo botão API." if data.get("base")
+            else "Somado ao que já estava aberto: {} arquivos.".format(len(data.get("sources", [])))
+            if add else "Abriu do zero — o que estava aberto foi substituído. Use + Adicionar"
+            " para somar.")
         book["data"] = data
         book.update(path=data.get("path", chosen), headers=data["headers"],
                     rows=data["rows"], kind=data["kind"])
@@ -1489,7 +2273,8 @@ def main(path=None):
         book["line"] = picked.get("line", "")
         book["month"] = data["month"]
         source.set("{}   ·   {} linhas".format(
-            " + ".join(Path(p).name for p in data["sources"]) if data.get("sources")
+            "Base salva" if data.get("base")
+            else " + ".join(Path(p).name for p in data["sources"]) if data.get("sources")
             else Path(chosen).name, len(data["rows"])))
         if data.get("months"):  # zip: several workbooks, each with its own month
             lidos = [f"{when[1]:02d}/{when[0]}" for _, when, _ in data["months"] if when and all(when)]
@@ -1527,9 +2312,429 @@ def main(path=None):
         for widget in (first, last, words, filter_button, download_button):
             widget.state(["!disabled"])
         hour_box.configure(state="readonly" if book["hour"] else "disabled")
-        if not add:
+        if not add and not data.get("base"):
             show_history(remember(chosen, {"rows": len(data["rows"]), "month": data["month"]}))
         refresh()
+
+    def clear_screen():
+        """Nothing to show: every number back to a dash, no stale chart left up."""
+        book.update(rows=[], headers=[], data=None, board=None, columns=[], path="", lines=[],
+                    chosen=[])
+        for text in (listing, sku_list):
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.configure(state="disabled")
+        for label in tile_values.values():
+            label.configure(text="—", foreground=dark["text"])
+        summary.set("—")
+        detected.set("")
+        draw_combo_chart(day_chart, [])
+        draw_rank_chart(rank_chart, [])
+        for widget in (first, last, words, filter_button, download_button):
+            widget.state(["disabled"])
+        hour_box.configure(state="disabled")
+        line_box.configure(state="disabled")
+        redraw()
+
+    def show_base(announce=None, keep_filters=False):
+        """Put the saved base on screen — what everyone sees when the app opens.
+
+        An automatic refresh keeps the dates, turno, lines and keyword the person
+        was looking at: a change in SharePoint must not undo their filter.
+        """
+        data = base_load() or {}
+        missing = data.get("missing") or []
+        if not data.get("rows"):
+            clear_screen()
+            source.set("Base vazia")
+            if missing:
+                say("Nada da base abriu: " + ", ".join(missing), dark["error"])
+            else:
+                say("A base está vazia — o admin entra em Unilever e alimenta em Adicionar API.")
+            return
+        kept = ((start_date.get(), end_date.get(), keyword.get(), hour.get(),
+                 list(book.get("chosen") or [])) if keep_filters and book.get("rows") else None)
+        book["adding"] = False
+        finish(data)
+        if kept:
+            for field, value in zip((start_date, end_date, keyword, hour), kept):
+                field.set(value)
+            book["chosen"] = [line for line in kept[4] if line in book["lines"]]
+            redraw()
+            refresh()
+        if missing:  # smaller totals must not pass for whole ones
+            say("Não abriram da base, e os totais estão sem eles: " + ", ".join(missing),
+                dark["error"])
+        elif announce:
+            say(announce, dark["ok"])
+
+    def centre(dialog, size=None):
+        """Open a dialog over the middle of the window, not wherever the system drops it."""
+        dialog.update_idletasks()
+        width, height = size or (dialog.winfo_reqwidth(), dialog.winfo_reqheight())
+        x = max(root.winfo_rootx() + (root.winfo_width() - width) // 2, 0)
+        y = max(root.winfo_rooty() + (root.winfo_height() - height) // 3, 0)
+        dialog.geometry(f"{width}x{height}+{x}+{y}" if size else f"+{x}+{y}")
+
+    def apply_role():
+        """Viewer: the Unilever button. Admin: Abrir, + Adicionar, Deslogar, Adicionar API."""
+        admin = book.get("admin")
+        for button in (open_button, add_button):
+            if admin:
+                button.pack(side="left", padx=(0, 8), before=login_button)
+            else:
+                button.pack_forget()
+        if admin:
+            api_button.pack(side="left", padx=(8, 0), after=login_button)
+            reopen_bar.grid()
+        else:
+            api_button.pack_forget()
+            reopen_bar.grid_remove()
+            if book.get("api") and book["api"].winfo_exists():
+                book["api"].destroy()  # an admin window must not outlive the admin
+        login_button.configure(text="Deslogar" if admin else "Unilever")
+        who.set(f"admin: {admin}" if admin else "")
+
+    def toggle_login():
+        """Unilever opens the login; once in, the same button is Deslogar."""
+        if book.get("admin"):
+            book["admin"] = None
+            apply_role()
+            say("Deslogado.")
+            return
+        dialog = tk.Toplevel(root, background=dark["card"], padx=24, pady=20)
+        dialog.title("Unilever — entrar")
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        user, secret, problem = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        ttk.Label(dialog, text="LOGIN", style="Field.TLabel").pack(anchor="w")
+        user_entry = ttk.Entry(dialog, textvariable=user, width=34)
+        user_entry.pack(fill="x", pady=(4, 12))
+        ttk.Label(dialog, text="SENHA", style="Field.TLabel").pack(anchor="w")
+        secret_entry = ttk.Entry(dialog, textvariable=secret, show="•", width=34)
+        secret_entry.pack(fill="x", pady=(4, 6))
+        ttk.Label(dialog, textvariable=problem, style="Card.TLabel",
+                  foreground=dark["error"]).pack(anchor="w")
+
+        def enter(*_):
+            if not admin_file().exists():
+                problem.set("Este .exe foi gerado sem admin configurado.")
+            elif is_admin(user.get(), secret.get()):
+                book["admin"] = user.get().strip()
+                dialog.destroy()
+                apply_role()
+                say(f"Logado como {book['admin']}: Adicionar API alimenta a base.", dark["ok"])
+            else:
+                secret.set("")
+                problem.set("Login ou senha não conferem.")
+                secret_entry.focus_set()
+
+        ttk.Button(dialog, text="Entrar", style="Accent.TButton", command=enter).pack(
+            fill="x", pady=(10, 0))
+        dialog.bind("<Return>", enter)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        centre(dialog)
+        user_entry.focus_set()
+        dialog.grab_set()
+
+    def sync_now():
+        """Check the live sources off the UI thread; refresh the screen if any changed."""
+        if book.get("syncing") or not load_sources()["sources"]:
+            return
+        book["syncing"] = True
+        news = queue.Queue()
+
+        def work():
+            try:
+                news.put(("ok", sync_sources()))
+            except Exception as error:
+                news.put(("erro", error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                kind, payload = news.get_nowait()
+            except queue.Empty:
+                root.after(200, poll)
+                return
+            book["syncing"] = False
+            if book.get("api_refresh"):
+                book["api_refresh"]()
+            if kind == "erro":
+                say(f"Erro ao atualizar as fontes: {payload}", dark["error"])
+                return
+            if payload:
+                said = "Atualizado às {}: {}.".format(datetime.now().strftime("%H:%M"), ", ".join(
+                    label + (f" (modificado por {who})" if who else "") for label, who in payload))
+                if not book.get("rows") or (book.get("data") or {}).get("base"):
+                    show_base(said, keep_filters=True)
+                else:  # the admin opened a file by hand: say it, do not swap the screen
+                    say(said + " Mostre a base em Adicionar API para ver.", dark["ok"])
+            broken = [s for s in load_sources()["sources"] if s.get("problem")]
+            problems = {(s["id"], s["problem"]) for s in broken}
+            if problems and problems != book.get("problems"):  # say it once, not every minute
+                say(f"Fonte {broken[0]['label']}: {broken[0]['problem']}", dark["error"])
+            book["problems"] = problems
+
+        root.after(200, poll)
+
+    def keep_syncing():
+        sync_now()
+        root.after(SYNC_EVERY_MS, keep_syncing)
+
+    def open_api():
+        """Admin only: .zip, the Graph token, live sources per month, and the base itself."""
+        if not book.get("admin"):
+            return
+        if book.get("api") and book["api"].winfo_exists():
+            book["api"].lift()
+            return
+        dialog = book["api"] = tk.Toplevel(root, background=dark["card"], padx=20, pady=16)
+        dialog.title("Adicionar API")
+        dialog.transient(root)
+        pages = ttk.Notebook(dialog)
+        pages.pack(fill="both", expand=True)
+        live = tk.Frame(pages, background=dark["card"], padx=4, pady=12)
+        stored = tk.Frame(pages, background=dark["card"], padx=4, pady=12)
+        pages.add(live, text="  Fontes em tempo real  ")
+        pages.add(stored, text="  Na base  ")
+        state = load_sources()
+        token, label, key, note = (tk.StringVar(value=state["token"]), tk.StringVar(),
+                                   tk.StringVar(), tk.StringVar())
+
+        zip_row = ttk.Frame(live, style="Card.TFrame")
+        zip_row.pack(fill="x")
+        send_button = ttk.Button(zip_row, text="Enviar .zip...", command=lambda: feed_file())
+        send_button.pack(side="left")
+        ttk.Label(zip_row, style="Hint.TLabel", text="importa uma vez · a mesma linha no mesmo mês"
+                  " substitui a anterior").pack(side="left", padx=(12, 0))
+
+        ttk.Label(live, text="TOKEN / CÓDIGO (MICROSOFT GRAPH)", style="Field.TLabel").pack(
+            anchor="w", pady=(16, 4))
+        token_row = ttk.Frame(live, style="Card.TFrame")
+        token_row.pack(fill="x")
+        ttk.Entry(token_row, textvariable=token, show="•").pack(side="left", fill="x", expand=True)
+        ttk.Button(token_row, text="Salvar token", command=lambda: save_token()).pack(
+            side="left", padx=(8, 0))
+        ttk.Label(live, style="Hint.TLabel", wraplength=930, text="O token de acesso do Graph vale"
+                  " cerca de 1 hora. Sem token, a chave precisa ser um link que baixe sem login ou"
+                  " um arquivo da pasta que o OneDrive sincroniza.").pack(anchor="w", pady=(4, 0))
+
+        add_row = ttk.Frame(live, style="Card.TFrame")
+        add_row.pack(fill="x", pady=(16, 0))
+        ttk.Label(add_row, text="NOME", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(add_row, text="CHAVE", style="Field.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(add_row, textvariable=label, width=22,
+                     values=[str(date.today().year), *MONTH_NAMES]).grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(4, 0))
+        ttk.Entry(add_row, textvariable=key).grid(row=1, column=1, sticky="we", pady=(4, 0))
+        probe_button = ttk.Button(add_row, text="Testar conexão", command=lambda: probe())
+        probe_button.grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
+        ttk.Button(add_row, text="Adicionar fonte", style="Accent.TButton",
+                   command=lambda: add()).grid(row=1, column=3, padx=(8, 0), pady=(4, 0))
+        add_row.columnconfigure(1, weight=1)
+        ttk.Label(live, style="Hint.TLabel", wraplength=930, text="Chave = drives/<id>/items/<id>"
+                  " de um arquivo ou de uma pasta (o ano, o mês — o app percorre tudo que tiver"
+                  " .xlsx dentro), a URL do Graph com ela (/content ou /children também servem),"
+                  " o link do SharePoint, ou o arquivo/pasta que o OneDrive sincroniza.").pack(
+            anchor="w", pady=(4, 10))
+
+        sources_table = ttk.Treeview(live, show="headings", selectmode="browse", height=6,
+                                     columns=("mes", "chave", "quando", "por", "situacao"))
+        for column, caption, width in (("mes", "Nome", 140), ("chave", "Chave", 220),
+                                       ("quando", "Atualizado", 110), ("por", "Por", 120),
+                                       ("situacao", "Situação", 300)):
+            sources_table.heading(column, text=caption, anchor="w")
+            sources_table.column(column, width=width, anchor="w",
+                                 stretch=column in ("chave", "situacao"))
+        sources_table.pack(fill="both", expand=True)
+        live_bottom = ttk.Frame(live, style="Card.TFrame")
+        live_bottom.pack(fill="x", pady=(8, 0))
+        ttk.Button(live_bottom, text="Remover fonte", command=lambda: drop()).pack(side="left")
+        ttk.Button(live_bottom, text="Verificar agora", command=sync_now).pack(side="left",
+                                                                              padx=(8, 0))
+        ttk.Label(live_bottom, textvariable=note, style="Hint.TLabel").pack(side="left",
+                                                                            padx=(12, 0))
+
+        base_table = ttk.Treeview(stored, show="headings", selectmode="extended", height=12,
+                                  columns=("linha", "mes", "linhas", "planilha", "origem", "quando"))
+        for column, caption, width in (("linha", "Linha", 70), ("mes", "Mês", 80),
+                                       ("linhas", "Linhas", 70), ("planilha", "Planilha", 280),
+                                       ("origem", "Origem", 220), ("quando", "Adicionado", 140)):
+            base_table.heading(column, text=caption, anchor="w")
+            base_table.column(column, width=width, anchor="w",
+                              stretch=column in ("planilha", "origem"))
+        base_table.pack(fill="both", expand=True)
+        stored_bottom = ttk.Frame(stored, style="Card.TFrame")
+        stored_bottom.pack(fill="x", pady=(8, 0))
+        delete_button = ttk.Button(stored_bottom, text="Apagar selecionados",
+                                   command=lambda: delete())
+        delete_button.pack(side="left")
+        ttk.Button(stored_bottom, text="Mostrar a base na tela", command=lambda: show_base()).pack(
+            side="left", padx=(8, 0))
+        base_note = tk.StringVar()
+        ttk.Label(stored_bottom, textvariable=base_note, style="Hint.TLabel").pack(
+            side="left", padx=(12, 0))
+
+        def short(text):
+            """A key fits the column: the end of a link or a path says which file it is."""
+            text = str(text)
+            return text if len(text) <= 42 else "…" + text[-41:]
+
+        def fill():
+            if not dialog.winfo_exists():
+                return
+            sources_table.delete(*sources_table.get_children())
+            for source in load_sources()["sources"]:
+                changed = str(source.get("changed") or "")
+                ignored = list((source.get("ignored") or {}).values())
+                if source.get("problem"):
+                    situation = source["problem"]
+                elif source_versions(source):
+                    situation = "em dia · {} arquivo(s) · conferido {}{}".format(
+                        source.get("files", 1), str(source.get("checked", ""))[11:16],
+                        f" · ignorado: {ignored[0]}" if ignored else "")
+                else:
+                    situation = "aguardando a primeira leitura"
+                sources_table.insert("", "end", iid=source["id"], values=(
+                    source.get("label", ""), short(source["key"]),
+                    f"{changed[8:10]}/{changed[5:7]} {changed[11:16]}" if changed else "—",
+                    source.get("by") or "—", situation))
+            note.set("confere a cada minuto enquanto o app está aberto"
+                     + (" · verificando..." if book.get("syncing") else ""))
+            base_table.delete(*base_table.get_children())
+            for entry in sorted(base_entries(), key=lambda e: (str(e.get("line") or ""),
+                                                               e.get("month") or [0, 0])):
+                month = entry.get("month")
+                base_table.insert("", "end", iid=entry["id"], values=(
+                    entry.get("line") or "—", f"{month[1]:02d}/{month[0]}" if month else "?",
+                    thousands(entry.get("rows", 0)), entry.get("file", ""),
+                    entry.get("origin", ""), str(entry.get("added", "")).replace("T", " ")[:16]))
+            base_note.set(f"{len(base_table.get_children())} planilhas na base")
+
+        book["api_refresh"] = fill
+
+        def save_token():
+            set_token(token.get())
+            say("Token salvo: as fontes são conferidas agora e a cada minuto.", dark["ok"])
+            sync_now()
+            fill()
+
+        def probe():
+            """Read only: what the typed token and key reach. Nothing is saved or downloaded."""
+            typed_key, typed_token = key.get(), token.get()
+            probe_button.state(["disabled"])
+            note.set("Testando a conexão...")
+            news = queue.Queue()
+
+            def work():
+                try:
+                    news.put(("ok", probe_source(typed_key, typed_token)))
+                except Exception as error:
+                    news.put(("erro", error))
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    kind, payload = news.get_nowait()
+                except queue.Empty:
+                    dialog.after(100, poll)
+                    return
+                probe_button.state(["!disabled"])
+                note.set("")
+                if kind == "erro":
+                    messagebox.showerror("Testar conexão", f"Não conectou.\n\n{payload}",
+                                         parent=dialog)
+                    return
+                shown = payload[:16] + ([f"... e mais {len(payload) - 16}"] if len(payload) > 16
+                                        else [])
+                messagebox.showinfo("Testar conexão", "\n".join(shown) + "\n\nNada foi baixado"
+                                    " nem salvo. Para trazer os dados, use Adicionar fonte.",
+                                    parent=dialog)
+
+            dialog.after(100, poll)
+
+        def add():
+            try:
+                add_source(label.get(), key.get())
+            except ValueError as error:
+                messagebox.showerror("Adicionar API", str(error), parent=dialog)
+                return
+            key.set("")
+            sync_now()  # the first check is the first download
+            fill()
+
+        def drop():
+            picked = sources_table.selection()
+            if not picked:
+                note.set("Selecione a fonte que vai sair.")
+                return
+            name = sources_table.set(picked[0], "mes")
+            if messagebox.askyesno("Remover fonte", f"Parar de acompanhar {name}? O que ela já"
+                                   " trouxe continua na base.", parent=dialog):
+                remove_source(picked[0])
+                fill()
+
+        def feed_file():
+            chosen = filedialog.askopenfilename(
+                parent=dialog, initialdir=start_dir(),
+                filetypes=[("Pacote ou Excel", "*.zip *.xlsx"), ("Pacote de relatórios", "*.zip")])
+            if not chosen:
+                return
+            send_button.state(["disabled"])
+            note.set("Lendo...")
+            news = queue.Queue()
+
+            def work():
+                try:
+                    data = load(chosen, progress=lambda i, n, name: news.put(
+                        ("step", f"Lendo {i}/{n}: {name}")))
+                    news.put(("ok", base_add(data, Path(chosen).name)))
+                except Exception as error:
+                    news.put(("erro", error))
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    kind, payload = news.get_nowait()
+                except queue.Empty:
+                    dialog.after(100, poll)
+                    return
+                if kind == "step":
+                    note.set(payload)
+                    dialog.after(50, poll)
+                    return
+                send_button.state(["!disabled"])
+                if kind == "erro":
+                    note.set("")
+                    messagebox.showerror("Adicionar API", str(payload), parent=dialog)
+                    return
+                saved, replaced = payload
+                fill()
+                show_base("{} planilha(s) salvas na base{}.".format(
+                    len(saved), f", {len(replaced)} substituída(s)" if replaced else ""))
+
+            dialog.after(100, poll)
+
+        def delete():
+            picked = base_table.selection()
+            if not picked:
+                base_note.set("Selecione o que apagar (Ctrl ou Shift marcam vários).")
+                return
+            names = [base_table.set(i, "planilha") for i in picked]
+            shown = "\n".join(names[:12]) + ("\n..." if len(names) > 12 else "")
+            if not messagebox.askyesno("Apagar da base", "Apagar {} planilha(s) da base para"
+                                       " sempre?\n\n{}".format(len(picked), shown), parent=dialog):
+                return
+            base_remove(picked)
+            fill()
+            show_base(f"{len(picked)} planilha(s) apagadas da base.")
+
+        fill()
+        centre(dialog, (1000, 640))
 
     def as_date(text):
         if not text.strip():
@@ -1598,7 +2803,7 @@ def main(path=None):
             # production exists in every hour, even the ones with nothing written down
             hours_result = summarize(book["headers"], book["rows"], **chosen)
         except Exception as error:
-            say(f"Erro: {error}", "#b00020")
+            say(f"Erro: {error}", dark["error"])
             return
         columns = result["columns"]
         when = [columns.index(c) for c in (book["date"], book["label"]) if c in columns]
@@ -1633,48 +2838,35 @@ def main(path=None):
             or "Com palavra-chave, só a frase que a contém aparece. Enter refiltra.")
 
     def draw_board(result):
-        """Second tab: the same filter, seen as production numbers."""
+        """Produção tab: the same filter, seen as production numbers."""
         numbers = production_summary(book["headers"], result["matched"])
         book["board"] = numbers
+        book["columns"], book["monthly"] = chart_columns(numbers)
+        book["picked"] = None
         about = ", ".join(terms())
-        dias = len(numbers["dias"])
-        quando = ("Produzido por hora em " + show(numbers["dias"][0][0]) if dias == 1
-                  else "Produzido por hora" if len(numbers["slots"]) <= 120
-                  else "Produzido por dia" if dias <= 31 else "Produzido por mês")
-        board_title.set(quando + ("   ·   clique numa barra para abrir os dias"
-                                  if dias > 1 else "")
-                        + (f" — só horas com {about}" if about else "")
-                        + "   (linha azul: planejado · verde bateu o plano · vermelho ficou abaixo)")
+        chart_title.set("Tempo de troca (changeover) e produção por {}   ·   troca total {:.0f} min{}"
+                        .format("mês" if book["monthly"] else "dia",
+                                sum(v for _, v in numbers["trocas_por_dia"]),
+                                f"   ·   só horas com {about}" if about else ""))
         sku_title.set(f"SKU e changeover por dia — {about}" if about
                       else "SKU e changeover por dia")
         tile_values["plan"].configure(text=thousands(numbers["plan"]))
         tile_values["produzido"].configure(text=thousands(numbers["produzido"]))
-        tile_values["faltou"].configure(text=thousands(numbers["faltou"]))
+        tile_values["faltou"].configure(text=thousands(numbers["faltou"]),
+                                        foreground=dark["miss"] if numbers["faltou"] > 0
+                                        else dark["text"])
         tile_values["atingido"].configure(
             text="—" if numbers["atingido"] is None else f"{numbers['atingido'] * 100:.1f}%")
-        tile_values["ocorrencias"].configure(text=str(sum(n for _, n in numbers["equipamentos"])))
-        # one day -> per hour; a short period -> per hour across the days; longer -> per day
-        if len(numbers["dias"]) == 1:
-            book["series"] = numbers["horas"]
-        elif len(numbers["slots"]) <= 120:
-            book["series"] = numbers["slots"]
-        elif len(numbers["dias"]) <= 31:
-            book["series"] = numbers["dias"]
-        else:  # more than a month of bars is a picket fence: one bar per month
-            book["series"] = numbers["meses"]
-        book["monthly"] = book["series"] is numbers["meses"]
-        draw_day_chart(day_chart, book["series"])
-        por_mes = len(numbers["dias"]) > 31
-        book["swaps"] = (_monthly(numbers["trocas_por_dia"]) if por_mes
-                         else numbers["trocas_por_dia"])
-        swap_title.set("Tempo de troca (changeover) por {} · total {:.0f} min".format(
-            "mês" if por_mes else "dia", sum(v for _, v in numbers["trocas_por_dia"])))
-        draw_time_chart(swap_chart, book["swaps"])
-        draw_rank_chart(rank_chart, numbers["equipamentos"], highlight=book.get("over"))
+        tile_values["ocorrencias"].configure(
+            text=thousands(sum(n for _, n in numbers["equipamentos"])))
+        redraw_board()
         sku_list.configure(state="normal")
         sku_list.delete("1.0", "end")
         for day in numbers["skus_por_dia"]:
             skus, swaps = day["skus"], day["swaps"]
+            # a mark per day, so a click on the chart can bring that day into view
+            sku_list.mark_set(f"day{day['day']:%Y%m%d}", "end-1c")
+            sku_list.mark_gravity(f"day{day['day']:%Y%m%d}", "left")
             head = show(day["day"]) + (f"   ·   {day['file']}" if day["file"] else "")
             sku_list.insert("end", head + "\n", "day")
             if not skus:
@@ -1700,34 +2892,42 @@ def main(path=None):
             sku_list.insert("end", "Nenhum SKU no filtro.", "quiet")
         sku_list.configure(state="disabled")
 
-    def _monthly(series):
-        months = {}
-        for day, value in series:
-            first = day.replace(day=1)
-            months[first] = months.get(first, 0) + value
-        return [(month, months[month]) for month in sorted(months)]
+    def redraw_board(*_):
+        if book.get("board"):
+            draw_combo_chart(day_chart, book["columns"], book["monthly"], book.get("picked"))
+            draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=book.get("over"),
+                            colour=dark["miss"], strong="#e88a4a", ink=dark["text"],
+                            quiet=dark["muted"])
 
-    def swap_hover(event):
-        series = book.get("swaps") or []
-        slot = tag_index(swap_chart, event.x, event.y, "slot")
-        if slot is None or slot >= len(series):
-            swap_chart.delete("tip")
+    def slot_under(event):
+        slot = tag_index(day_chart, event.x, event.y, "slot")
+        return slot if slot is not None and slot < len(book.get("columns") or []) else None
+
+    def pick_day(event):
+        """Click a day: highlight it and bring its SKU and changeovers into view."""
+        slot = slot_under(event)
+        if slot is None:
             return
-        label, minutes = series[slot]
-        draw_tip(swap_chart, event.x, event.y,
-                 [show(label), f"Troca: {minutes:.0f} min"])
+        book["picked"] = slot
+        redraw_board()
+        when = book["columns"][slot][0]
+        days = [d["day"] for d in book["board"]["skus_por_dia"]
+                if (d["day"].replace(day=1) if book["monthly"] else d["day"]) == when]
+        sku_list.tag_remove("picked", "1.0", "end")
+        if days:
+            mark = f"day{days[0]:%Y%m%d}"
+            sku_list.tag_add("picked", mark, f"{mark} lineend+1c")
+            sku_list.yview(mark)
+        say("{} selecionado. Duplo clique filtra só ele.".format(
+            when.strftime("%m/%Y") if book["monthly"] else show(when)))
 
     def zoom_in(event):
-        """Click a bar to open the level below: month -> its days, day -> its hours."""
-        series = book.get("series") or []
-        slot = tag_index(day_chart, event.x, event.y, "slot")
-        if slot is None or slot >= len(series):
+        """Double-click a day (or month) to filter the whole screen down to it."""
+        slot = slot_under(event)
+        if slot is None:
             return
-        label = series[slot][0]
-        day = label[0] if isinstance(label, tuple) else label
-        if not hasattr(day, "day"):
-            return  # already at hour level: nothing finer to open
-        if book.get("monthly"):
+        day = book["columns"][slot][0]
+        if book["monthly"]:
             first = day.replace(day=1)
             last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
         else:
@@ -1736,32 +2936,21 @@ def main(path=None):
         end_date.set(show(last))
         refresh()
         say("Abrindo {}. Apague as datas para voltar ao período inteiro.".format(
-            first.strftime("%m/%Y") if book.get("monthly") else show(first)))
-
-    def redraw_board(*_):
-        if book.get("board"):
-            draw_day_chart(day_chart, book.get("series") or book["board"]["dias"])
-            draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=book.get("over"))
-            draw_time_chart(swap_chart, book.get("swaps") or [])
-
-    def slot_under(event):
-        return tag_index(day_chart, event.x, event.y, "slot")
+            first.strftime("%m/%Y") if book["monthly"] else show(first)))
 
     def day_hover(event):
-        series = book.get("series") or []
         slot = slot_under(event)
-        if slot is None or slot >= len(series):
+        if slot is None:
             day_chart.delete("tip")
             return
-        label, planned, produced = series[slot]
-        title = (f"{show(label[0])} · {label[1]}" if isinstance(label, tuple)
-                 else show(label) if hasattr(label, "day") else str(label))
-        lines = [title, f"Produzido: {thousands(produced)}"]
+        when, minutes, planned, produced = book["columns"][slot]
+        lines = [when.strftime("%m/%Y") if book["monthly"] else show(when),
+                 f"Changeover: {minutes:.0f} min", f"Produzido: {thousands(produced)}"]
         if planned is None:
-            lines.append("Planejado: não anotado")
+            lines.append("Plano: não anotado")
         else:
             gap = produced - planned
-            lines += [f"Planejado: {thousands(planned)}",
+            lines += [f"Plano: {thousands(planned)}",
                       "{}{} ({:.0f}%)".format("+" if gap >= 0 else "", thousands(gap),
                                               produced / planned * 100 if planned else 0)]
         draw_tip(day_chart, event.x, event.y, lines)
@@ -1776,7 +2965,7 @@ def main(path=None):
             return
         book["over"] = over
         rank_chart.configure(cursor="hand2" if over is not None else "")
-        draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=over)
+        redraw_board()
         if over is not None:
             name = book["board"]["equipamentos"][over][0]
             say(f"Clique em {name} para ver só o que envolve esse equipamento.")
@@ -1808,19 +2997,17 @@ def main(path=None):
             written = download(target, book["headers"], found["matched"], book.get("line", ""),
                                book["date"], book["label"] or book["hour"], book["text"],
                                chosen["terms"])
-            say(f"{written} ocorrências gravadas em {target}", "#1b7a3d")
+            say(f"{written} ocorrências gravadas em {target}", dark["ok"])
         except Exception as error:
-            say(f"Erro: {error}", "#b00020")
+            say(f"Erro: {error}", dark["error"])
 
     show_history()
     day_chart.bind("<Configure>", redraw_board)
     day_chart.bind("<Motion>", day_hover)
-    day_chart.bind("<Button-1>", zoom_in)
+    day_chart.bind("<Button-1>", pick_day)
+    day_chart.bind("<Double-Button-1>", zoom_in)
     day_chart.bind("<Leave>", lambda _: day_chart.delete("tip"))
     rank_chart.bind("<Configure>", redraw_board)
-    swap_chart.bind("<Configure>", redraw_board)
-    swap_chart.bind("<Motion>", swap_hover)
-    swap_chart.bind("<Leave>", lambda _: swap_chart.delete("tip"))
     rank_chart.bind("<Motion>", rank_hover)
     rank_chart.bind("<Leave>", lambda _: (book.update(over=None), redraw_board()))
     rank_chart.bind("<Button-1>", rank_click)
@@ -1829,12 +3016,23 @@ def main(path=None):
     root.bind("<Return>", refresh)
     hour_box.bind("<<ComboboxSelected>>", refresh)
     line_box.bind("<<ComboboxSelected>>", add_line)
+    apply_role()  # everyone starts as a viewer; the Unilever button logs the admin in
     if path:
         root.after(50, lambda: open_file(path))
+    else:
+        root.after(50, show_base)
+    root.after(2000, keep_syncing)  # live sources: checked now and every minute after
     root.mainloop()
 
 
 if __name__ == "__main__":
-    import sys
+    if sys.argv[1:2] == ["--admin"] and len(sys.argv) == 3:
+        # python excel_filter.py --admin <login>: (re)writes admin.json, asking the password twice
+        import getpass
 
-    main(*sys.argv[1:2])  # optional: path of a spreadsheet to open right away
+        typed = getpass.getpass("Senha do admin: ")
+        if typed != getpass.getpass("De novo: "):
+            sys.exit("As senhas não conferem.")
+        print(f"Gravado em {make_admin(sys.argv[2], typed)}")
+    else:
+        main(*sys.argv[1:2])  # optional: path of a spreadsheet to open right away

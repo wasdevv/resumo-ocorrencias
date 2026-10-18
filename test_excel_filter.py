@@ -1,6 +1,10 @@
 """python3 -m unittest discover -s excel_filter"""
 
+import io
+import json
+import os
 import tempfile
+import time
 import unittest
 import zipfile
 from datetime import date, datetime
@@ -469,24 +473,54 @@ class Charts(unittest.TestCase):
         if hasattr(self, "root"):
             self.root.destroy()
 
-    def test_day_chart_draws_one_bar_per_day_with_its_planned_line(self):
-        days = [(date(2023, 11, 1), 1000, 800), (date(2023, 11, 2), 1000, 900)]
-        excel_filter.draw_day_chart(self.canvas, days)
-        blue = [i for i in self.canvas.find_all()
-                if self.canvas.type(i) == "line" and self.canvas.itemcget(i, "fill") == "#1565c0"]
-        self.assertEqual((len(self.painted()), len(blue)), (2, 2))
+    def made(self):
+        """The production bars of the combo chart, in drawing order."""
+        c = excel_filter.BOARD_COLOURS
+        return [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "rectangle"
+                and self.canvas.itemcget(i, "fill") in (c["hit"], c["miss"], c["unknown"])]
 
-    def test_the_bar_is_green_when_it_reaches_the_plan_and_red_when_it_does_not(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 800),
-                                                  (date(2023, 11, 2), 1000, 1200)])
-        self.assertEqual([self.canvas.itemcget(i, "fill") for i in self.painted()],
-                         ["#c62828", "#2e7d32"])
+    def plan_ticks(self):
+        return [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "line"]
+
+    def test_combo_chart_draws_one_production_bar_per_day_with_its_plan_tick(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 10, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 900)])
+        self.assertEqual((len(self.made()), len(self.plan_ticks())), (2, 2))
+
+    def test_changeover_is_the_bar_on_top(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 30, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 900)])
+        swap = [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "rectangle"
+                and self.canvas.itemcget(i, "fill") == excel_filter.BOARD_COLOURS["swap"]]
+        self.assertEqual(len(swap), 1)  # o dia sem troca não ganha barra
+        self.assertLess(self.canvas.coords(swap[0])[3], self.canvas.coords(self.made()[0])[1])
+
+    def test_the_bar_is_blue_when_it_reaches_the_plan_and_orange_when_it_does_not(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 0, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 1200)])
+        c = excel_filter.BOARD_COLOURS
+        self.assertEqual([self.canvas.itemcget(i, "fill") for i in self.made()],
+                         [c["miss"], c["hit"]])
 
     def test_every_slot_is_tagged_so_the_mouse_finds_its_numbers(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 800),
-                                                  (date(2023, 11, 2), 1000, 900)])
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 5, 1000, 800),
+                                                    (date(2023, 11, 2), 5, 1000, 900)])
         self.assertTrue(self.canvas.find_withtag("slot0"))
         self.assertTrue(self.canvas.find_withtag("slot1"))
+
+    def test_the_picked_day_gets_a_highlight_behind_it(self):
+        columns = [(date(2023, 11, d), 5, 1000, 900) for d in (1, 2, 3)]
+        select = excel_filter.BOARD_COLOURS["select"]
+
+        def highlights():
+            return [i for i in self.canvas.find_all() if self.canvas.type(i) == "rectangle"
+                    and self.canvas.itemcget(i, "fill") == select]
+        excel_filter.draw_combo_chart(self.canvas, columns)
+        self.assertEqual(highlights(), [])
+        excel_filter.draw_combo_chart(self.canvas, columns, selected=1)
+        box = self.canvas.coords(highlights()[0])
+        middle = self.canvas.coords(self.made()[1])
+        self.assertTrue(box[0] <= middle[0] and middle[2] <= box[2])
 
     def test_the_tip_shows_the_lines_it_was_given(self):
         excel_filter.draw_tip(self.canvas, 50, 50, ["06h - 07h", "Produzido: 1.700"])
@@ -509,11 +543,9 @@ class Charts(unittest.TestCase):
                    if self.canvas.type(i) == "rectangle")
         self.assertLessEqual(self.canvas.coords(box)[2], efetiva)
 
-    def test_producing_above_the_plan_draws_the_bar_past_the_blue_line(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 1200)])
-        bar = self.painted()[0]
-        line = next(i for i in self.canvas.find_all() if self.canvas.type(i) == "line"
-                    and self.canvas.itemcget(i, "fill") == "#1565c0")
+    def test_producing_above_the_plan_draws_the_bar_past_the_plan_tick(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 0, 1000, 1200)])
+        bar, line = self.made()[0], self.plan_ticks()[0]
         self.assertLess(self.canvas.coords(bar)[1], self.canvas.coords(line)[1])  # y menor = mais alto
 
     def painted(self):
@@ -542,7 +574,7 @@ class Charts(unittest.TestCase):
 
 
     def test_nothing_to_draw_says_so_instead_of_an_empty_box(self):
-        excel_filter.draw_day_chart(self.canvas, [])
+        excel_filter.draw_combo_chart(self.canvas, [])
         texts = [self.canvas.itemcget(i, "text") for i in self.canvas.find_all()]
         self.assertIn("Sem dados no filtro", texts)
 
@@ -598,20 +630,6 @@ class OneDay(unittest.TestCase):
         self.assertEqual(board["dias"], [(date(2023, 11, 6), 5655, 3600)])
         self.assertEqual(sum(p for _, p, _ in board["horas"]), board["plan"])
 
-    def test_the_chart_takes_hour_labels_as_well_as_dates(self):
-        tk = __import__("tkinter")
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            self.skipTest(f"sem display: {error}")
-        root.withdraw()
-        canvas = tk.Canvas(root, width=400, height=200)
-        excel_filter.draw_day_chart(canvas, production_summary(self.HEADERS, self.ROWS)["horas"])
-        labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
-                  if canvas.type(i) == "text"]
-        self.assertIn("06h", labels)
-        root.destroy()
-
     def test_a_single_bar_does_not_stretch_across_the_chart(self):
         tk = __import__("tkinter")
         try:
@@ -622,10 +640,10 @@ class OneDay(unittest.TestCase):
         canvas = tk.Canvas(root, width=900, height=200)
         canvas.pack()
         root.update()
-        excel_filter.draw_day_chart(canvas, [(date(2023, 11, 6), 1885, 1700)])
-        bar = next(i for i in canvas.find_all() if canvas.type(i) == "rectangle")
+        excel_filter.draw_combo_chart(canvas, [(date(2023, 11, 6), 30, 1885, 1700)])
+        bar = next(i for i in canvas.find_withtag("slot") if canvas.type(i) == "rectangle")
         left, _, right, _ = canvas.coords(bar)
-        self.assertLessEqual(right - left, 54)
+        self.assertLessEqual(right - left, 40)
         root.destroy()
 
 
@@ -645,8 +663,8 @@ class PointerLookup(unittest.TestCase):
         self.root.destroy()
 
     def test_finds_the_slot_of_the_day_under_the_point(self):
-        days = [(date(2023, 11, d), 1000, 800) for d in range(1, 6)]
-        excel_filter.draw_day_chart(self.canvas, days)
+        days = [(date(2023, 11, d), 10, 1000, 800) for d in range(1, 6)]
+        excel_filter.draw_combo_chart(self.canvas, days)
         left = [min(self.canvas.bbox(i)[0] for i in self.canvas.find_withtag(f"slot{i}"))
                 for i in range(5)]
         for i, x in enumerate(left):
@@ -659,7 +677,7 @@ class PointerLookup(unittest.TestCase):
         self.assertEqual(excel_filter.tag_index(self.canvas, 200, middle, "bar"), 1)
 
     def test_an_empty_chart_has_nothing_under_the_point(self):
-        excel_filter.draw_day_chart(self.canvas, [])
+        excel_filter.draw_combo_chart(self.canvas, [])
         self.assertIsNone(excel_filter.tag_index(self.canvas, 50, 50, "slot"))
 
 
@@ -682,20 +700,6 @@ class Slots(unittest.TestCase):
     def test_the_slots_add_up_to_the_days(self):
         board = production_summary(self.HEADERS, self.ROWS)
         self.assertEqual(sum(p for _, p, _ in board["slots"]), sum(p for _, p, _ in board["dias"]))
-
-    def test_the_day_number_is_drawn_once_per_day_not_once_per_hour(self):
-        tk = __import__("tkinter")
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            self.skipTest(f"sem display: {error}")
-        root.withdraw()
-        canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, production_summary(self.HEADERS, self.ROWS)["slots"])
-        labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
-                  if canvas.type(i) == "text"]
-        self.assertEqual([l for l in labels if l in ("06", "07")], ["06", "07"])
-        root.destroy()
 
 
 class SkuAndChangeover(unittest.TestCase):
@@ -919,8 +923,8 @@ class MonthlySeries(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 1, 1), 100, 90),
-                                             (date(2026, 2, 1), 100, 110)])
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 1, 1), 5, 100, 90),
+                                               (date(2026, 2, 1), 5, 100, 110)], monthly=True)
         labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
                   if canvas.type(i) == "text"]
         self.assertIn("01/26", labels)
@@ -935,8 +939,8 @@ class MonthlySeries(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 1, 5), 100, 90),
-                                             (date(2026, 1, 6), 100, 110)])
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 1, 5), 5, 100, 90),
+                                               (date(2026, 1, 6), 5, 100, 110)])
         labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
                   if canvas.type(i) == "text"]
         self.assertIn("05", labels)
@@ -1093,13 +1097,13 @@ class UnknownPlan(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=400, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 2, 3), None, 1500)])
-        painted = [canvas.itemcget(i, "fill") for i in canvas.find_all()
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 2, 3), 0, None, 1500)])
+        painted = [canvas.itemcget(i, "fill") for i in canvas.find_withtag("slot")
                    if canvas.type(i) == "rectangle" and canvas.itemcget(i, "fill")]
-        self.assertEqual(painted, ["#9aa7bd"])  # cinza: sem plano não há "bateu"
-        blue = [i for i in canvas.find_all() if canvas.type(i) == "line"
-                and canvas.itemcget(i, "fill") == "#1565c0"]
-        self.assertEqual(blue, [])  # e sem linha azul, porque não há alvo
+        # cinza-ardósia: sem plano não há "bateu"
+        self.assertEqual(painted, [excel_filter.BOARD_COLOURS["unknown"]])
+        ticks = [i for i in canvas.find_withtag("slot") if canvas.type(i) == "line"]
+        self.assertEqual(ticks, [])  # e sem marca de plano, porque não há alvo
         root.destroy()
 
     def test_the_format_of_the_hour_is_carried_as_data(self):
@@ -1178,3 +1182,564 @@ class FastReader(unittest.TestCase):
         self.assertEqual(first[headers.index("Período")], "06h - 10h")  # a mescla de 4 horas
         self.assertEqual(first[headers.index("Trocas")], "31m19s")
         self.assertEqual(first[headers.index("Formato")], "Hagrid")
+
+
+class ChartColumns(unittest.TestCase):
+    """Changeover and production share one axis, one column per day or month."""
+
+    def numbers(self, days):
+        return {"dias": [(d, 1000, 900) for d in days], "meses": [],
+                "trocas_por_dia": [(d, 10) for d in days]}
+
+    def test_each_day_carries_its_changeover_and_production(self):
+        days = [date(2026, 1, 5), date(2026, 1, 6)]
+        columns, monthly = excel_filter.chart_columns(self.numbers(days))
+        self.assertFalse(monthly)
+        self.assertEqual(columns, [(date(2026, 1, 5), 10, 1000, 900), (date(2026, 1, 6), 10, 1000, 900)])
+
+    def test_more_than_a_month_goes_monthly_and_adds_the_changeover_up(self):
+        days = [date(2026, 1, d) for d in range(1, 32)] + [date(2026, 2, 1)]
+        numbers = self.numbers(days)
+        numbers["meses"] = [(date(2026, 1, 1), 31000, 27900), (date(2026, 2, 1), 1000, 900)]
+        columns, monthly = excel_filter.chart_columns(numbers)
+        self.assertTrue(monthly)
+        self.assertEqual([(when, minutes) for when, minutes, _, _ in columns],
+                         [(date(2026, 1, 1), 310), (date(2026, 2, 1), 10)])
+
+
+
+class Access(unittest.TestCase):
+    """Who is the admin. Test credentials only: the real ones never enter the repo."""
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "admin.json"
+        excel_filter.make_admin("admin.teste", "Senha-Certa1", self.path)
+
+    def test_the_right_login_and_password_open_the_admin(self):
+        self.assertTrue(excel_filter.is_admin("admin.teste", "Senha-Certa1", self.path))
+        self.assertTrue(excel_filter.is_admin("  Admin.Teste ", "Senha-Certa1", self.path))
+
+    def test_anything_else_stays_a_viewer(self):
+        for user, password in (("admin.teste", "senha-certa1"), ("outra", "Senha-Certa1"),
+                               ("", ""), ("admin.teste", "")):
+            self.assertFalse(excel_filter.is_admin(user, password, self.path), (user, password))
+
+    def test_the_password_itself_is_never_written(self):
+        self.assertNotIn("Senha-Certa1", self.path.read_text())
+
+    def test_no_file_or_a_broken_one_means_no_admin(self):
+        self.assertFalse(excel_filter.is_admin("admin.teste", "Senha-Certa1",
+                                               self.path.with_name("nada.json")))
+        for broken in ("[]", "7", "{}", "não é json", '{"user": "admin.teste", "salt": "zz"}'):
+            self.path.write_text(broken)
+            self.assertFalse(excel_filter.is_admin("admin.teste", "Senha-Certa1", self.path), broken)
+
+
+class SavedBase(unittest.TestCase):
+    """What the admin feeds stays on disk, once per line and month."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp()) / "base"
+
+    def report(self, line, month):
+        book = Workbook()
+        book.remove(book.active)
+        plan = book.create_sheet("Plan.Prod")
+        for i in range(28):
+            plan.cell(1 + i, 2).value = datetime(month[0], month[1], 1 + i)
+        for day in range(1, 6):
+            sheet = book.create_sheet(str(day))
+            sheet.cell(1, 2).value = f"LINHA {line} - 1º TURNO"
+            sheet.cell(26, 2).value = "Horário"
+            sheet.cell(26, 14).value = "Principais Perdas"
+            for h in range(8):
+                sheet.cell(27 + h, 2).value = f"{6 + h:02d}h - {7 + h:02d}h"
+            sheet.cell(27, 14).value = f"Gasser - alarme no dia {day}"
+        return book
+
+    def bundle(self, months, name="pacote.zip", line="D01"):
+        path = Path(tempfile.mkdtemp()) / name
+        with zipfile.ZipFile(path, "w") as package:
+            for month in months:
+                where = Path(tempfile.mkdtemp()) / f"Linha 1 - {month[1]:02d}.xlsx"
+                self.report(line, month).save(where)
+                package.write(where, where.name)
+        return load(path)
+
+    def test_what_goes_in_comes_back_the_same_with_dates_as_dates(self):
+        data = self.bundle([(2026, 1), (2026, 2)])
+        saved, replaced = excel_filter.base_add(data, "pacote.zip", self.folder)
+        self.assertEqual((len(saved), replaced), (2, []))
+        back = excel_filter.base_load(self.folder)
+        self.assertEqual(sorted(map(repr, (v for _, v in back["rows"]))),
+                         sorted(map(repr, (v for _, v in data["rows"]))))
+        day = back["rows"][0][1][back["headers"].index("Data")]
+        self.assertIs(type(day), date)
+        self.assertEqual([when for _, when, _ in back["months"]], [(2026, 1), (2026, 2)])
+
+    def test_sending_the_same_month_again_replaces_it_instead_of_doubling(self):
+        data = self.bundle([(2026, 1), (2026, 2)])
+        excel_filter.base_add(data, "pacote.zip", self.folder)
+        files_before = sorted(p.name for p in self.folder.iterdir())
+        again = self.bundle([(2026, 1), (2026, 2)], name="pacote (1).zip")
+        _, replaced = excel_filter.base_add(again, "pacote (1).zip", self.folder)
+        self.assertEqual(len(replaced), 2)
+        self.assertEqual(len(excel_filter.base_entries(self.folder)), 2)
+        self.assertEqual(len(excel_filter.base_load(self.folder)["rows"]), len(data["rows"]))
+        self.assertEqual(len(list(self.folder.iterdir())), len(files_before))  # old files went away
+
+    def test_a_new_month_or_another_line_adds_to_what_is_there(self):
+        excel_filter.base_add(self.bundle([(2026, 1)]), "d01.zip", self.folder)
+        excel_filter.base_add(self.bundle([(2026, 2)]), "d01.zip", self.folder)
+        excel_filter.base_add(self.bundle([(2026, 1)], line="D02"), "d02.zip", self.folder)
+        keys = sorted(e["key"] for e in excel_filter.base_entries(self.folder))
+        self.assertEqual(keys, ["D01|2026-01", "D01|2026-02", "D02|2026-01"])
+
+    def test_deleting_takes_the_rows_and_the_file_away(self):
+        excel_filter.base_add(self.bundle([(2026, 1), (2026, 2)]), "pacote.zip", self.folder)
+        january = next(e for e in excel_filter.base_entries(self.folder) if e["month"] == [2026, 1])
+        left = excel_filter.base_remove([january["id"]], self.folder)
+        self.assertEqual([e["month"] for e in left], [[2026, 2]])
+        self.assertFalse((self.folder / f"{january['id']}.json").exists())
+        back = excel_filter.base_load(self.folder)
+        self.assertEqual({when for _, when, _ in back["months"]}, {(2026, 2)})
+        excel_filter.base_remove([left[0]["id"]], self.folder)
+        self.assertIsNone(excel_filter.base_load(self.folder))
+
+    def test_an_empty_or_broken_base_is_an_empty_base(self):
+        self.assertIsNone(excel_filter.base_load(self.folder))
+        self.folder.mkdir(parents=True)
+        for broken in ("[]", "7", "não é json"):
+            (self.folder / "indice.json").write_text(broken)
+            self.assertIsNone(excel_filter.base_load(self.folder))
+
+    def test_an_edited_index_cannot_reach_outside_the_folder(self):
+        self.folder.mkdir(parents=True)
+        outside = self.folder.parent / "fora.json"
+        outside.write_text("{}")
+        (self.folder / "indice.json").write_text(json.dumps([{"id": "../fora", "key": "x|?"}]))
+        self.assertEqual(excel_filter.base_entries(self.folder), [])
+        excel_filter.base_remove(["../fora"], self.folder)
+        self.assertTrue(outside.exists())
+
+    def test_a_lost_file_is_reported_not_hidden(self):
+        excel_filter.base_add(self.bundle([(2026, 1), (2026, 2)]), "pacote.zip", self.folder)
+        lost = excel_filter.base_entries(self.folder)[0]
+        (self.folder / f"{lost['id']}.json").unlink()
+        self.assertEqual(excel_filter.base_load(self.folder)["missing"], [lost["file"]])
+
+    def test_only_shift_reports_with_a_read_month_go_in(self):
+        with self.assertRaises(ValueError):
+            excel_filter.base_add({"kind": "tabela", "headers": [], "rows": []}, "x", self.folder)
+        with self.assertRaises(ValueError):
+            excel_filter.base_add({"kind": "turno", "month_guessed": True, "headers": [], "rows": []},
+                                  "x", self.folder)
+
+
+def shift_book(line, month=None, note="Gasser - alarme no dia {day}"):
+    """A small real shift report; without `month` it has no planning sheet to say one."""
+    book = Workbook()
+    book.remove(book.active)
+    if month:
+        plan = book.create_sheet("Plan.Prod")
+        for i in range(28):
+            plan.cell(1 + i, 2).value = datetime(month[0], month[1], 1 + i)
+    for day in range(1, 6):
+        sheet = book.create_sheet(str(day))
+        sheet.cell(1, 2).value = f"LINHA {line} - 1º TURNO"
+        sheet.cell(26, 2).value = "Horário"
+        sheet.cell(26, 14).value = "Principais Perdas"
+        for h in range(8):
+            sheet.cell(27 + h, 2).value = f"{6 + h:02d}h - {7 + h:02d}h"
+        sheet.cell(27, 14).value = note.format(day=day)
+    return book
+
+
+def shift_zip(path, line, months, note="Gasser - alarme no dia {day}"):
+    """A real zip of small shift reports, one per month, the way the bundles come."""
+    with zipfile.ZipFile(path, "w") as package:
+        for month in months:
+            where = Path(tempfile.mkdtemp()) / f"Linha - {month[1]:02d}.xlsx"
+            shift_book(line, month, note).save(where)
+            package.write(where, where.name)
+    return Path(path)
+
+
+def book_bytes(book):
+    where = Path(tempfile.mkdtemp()) / "x.xlsx"
+    book.save(where)
+    return where.read_bytes()
+
+
+def only(entries):
+    """(version, downloaded file or None, who) of a source that is a single file."""
+    (fid, version, fetch, who, month, name), = entries
+    return version, (fetch() if fetch else None), who
+
+
+class Serving:
+    """A real HTTP server on 127.0.0.1 answering from a function the test controls."""
+
+    def serve(self, routes):
+        import http.server
+        import threading
+        seen = []
+
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, dict(self.headers)))
+                status, headers, body = routes(self)
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}", seen
+
+
+class Links(Serving, unittest.TestCase):
+    """A plain link: the file only when its version moved, or a clear no."""
+
+    def test_a_sharepoint_link_asks_for_the_file_itself(self):
+        self.assertEqual(excel_filter.direct_link("https://empresa.sharepoint.com/:u:/s/x/EaB?e=abc"),
+                         "https://empresa.sharepoint.com/:u:/s/x/EaB?e=abc&download=1")
+        self.assertEqual(excel_filter.direct_link("https://exemplo.com/a.zip"),
+                         "https://exemplo.com/a.zip")
+        with self.assertRaises(ValueError):
+            excel_filter.direct_link("D01_Relatorio.zip")
+
+    def test_the_file_comes_once_and_again_only_when_its_etag_moves(self):
+        package = io.BytesIO()
+        with zipfile.ZipFile(package, "w") as bundle:
+            bundle.writestr("pacote/leia.txt", "oi")
+        current = {"etag": '"v1"'}
+
+        def routes(request):  # a server that honours If-None-Match, as HTTP says
+            if request.headers.get("If-None-Match") == current["etag"]:
+                return 304, [], b""
+            return 200, [("ETag", current["etag"]), ("Content-Disposition",
+                                                     'attachment; filename="D01_Relatorio.zip"')], \
+                package.getvalue()
+        base, _ = self.serve(routes)
+        source = {"key": base + "/arquivo"}
+        version, path, _ = only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))
+        self.assertEqual((version, path.name), ('etag:"v1"', "D01_Relatorio.zip"))
+        source["versions"] = {"": version}
+        self.assertIsNone(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[1])
+        current["etag"] = '"v2"'
+        self.assertEqual(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[0],
+                         'etag:"v2"')
+
+    def test_without_any_version_header_the_content_decides(self):
+        body = book_bytes(Workbook())
+        base, _ = self.serve(lambda request: (200, [], body))
+        source = {"key": base + "/arquivo"}
+        version, path, _ = only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))
+        self.assertEqual(path.suffix, ".xlsx")
+        self.assertTrue(version.startswith("sha256:"))
+        source["version"] = version  # what a build before folders saved
+        self.assertIsNone(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[1])
+
+    def test_testing_a_link_reads_only_its_first_bytes(self):
+        body = book_bytes(Workbook())
+        base, _ = self.serve(lambda request: (200, [("Content-Disposition",
+                                                     'attachment; filename="Outubro.xlsx"')], body))
+        self.assertEqual(excel_filter.probe_source(base + "/x"),
+                         ["O link entrega um .zip/.xlsx: Outubro.xlsx"])
+        page, _ = self.serve(lambda request: (200, [], b"<html>Entrar</html>"))
+        with self.assertRaises(ValueError) as said:
+            excel_filter.probe_source(page + "/x")
+        self.assertIn("login", str(said.exception))
+
+    def test_a_login_page_is_said_never_read_as_a_spreadsheet(self):
+        for status, body in ((200, b"<html>Entrar na sua conta</html>"), (403, b"proibido"),
+                             (401, b"")):
+            base, _ = self.serve(lambda request: (status, [], body))
+            with self.assertRaises(ValueError) as said:
+                excel_filter.check_source({"key": base + "/x"}, folder=tempfile.mkdtemp())
+            self.assertIn("login", str(said.exception))
+
+
+class KeysAndMonths(unittest.TestCase):
+    """What gets pasted, and what the folder names say."""
+
+    def test_a_sharing_link_becomes_the_id_the_graph_docs_describe(self):
+        link = "https://onedrive.live.com/redir?resid=1231244193912!12&authKey=1201919!12921!1"
+        self.assertEqual(excel_filter.share_id(link), "u!aHR0cHM6Ly9vbmVkcml2ZS5saXZlLmNvbS9yZWRpcj9y"
+                         "ZXNpZD0xMjMxMjQ0MTkzOTEyITEyJmF1dGhLZXk9MTIwMTkxOSExMjkyMSEx")
+        odd = "https://x.sharepoint.com/?a=~~~>>>???"  # base64 of this needs + and /
+        encoded = excel_filter.share_id(odd)[2:]
+        self.assertFalse(set("+/=") & set(encoded))
+        import base64
+        self.assertEqual(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode(), odd)
+
+    def test_every_form_copilot_and_graph_explorer_hand_out_is_the_same_key(self):
+        bare = "drives/b!AbCdEf123_xy/items/01ABCDEFGHIJ"
+        for pasted in (bare, "/" + bare,
+                       f"https://graph.microsoft.com/v1.0/{bare}",
+                       f"https://graph.microsoft.com/v1.0/{bare}/content",
+                       f"https://graph.microsoft.com/v1.0/{bare}/children",
+                       f"GET https://graph.microsoft.com/v1.0/{bare}/children"):
+            self.assertEqual(excel_filter.graph_key(pasted), bare, pasted)
+            self.assertEqual(excel_filter.graph_item_url(pasted), f"{excel_filter.GRAPH}/{bare}")
+        self.assertTrue(excel_filter.graph_item_url("https://empresa.sharepoint.com/:x:/s/a/EaB")
+                        .endswith("/driveItem"))
+        with self.assertRaises(ValueError):
+            excel_filter.graph_item_url("10283139X--X123")
+
+    def test_the_month_comes_from_the_folder_names(self):
+        self.assertEqual(excel_filter.month_of(["General", "2026", "10 - Outubro",
+                                                "Relatório Linha 1.xlsx"]), (2026, 10))
+        self.assertEqual(excel_filter.month_of(["2026", "09 - Setembro", "Linha 2",
+                                                "Relatório.xlsx"]), (2026, 9))
+        self.assertEqual(excel_filter.month_of(["turno 2026-03"]), (2026, 3))
+        self.assertIsNone(excel_filter.month_of(["10 - Outubro"]))  # no year anywhere above
+        self.assertIsNone(excel_filter.month_of(["General", "2026", "Relatório Linha 1.xlsx"]))
+
+
+class Graph(Serving, unittest.TestCase):
+    """Microsoft Graph, played by a local server written from its docs: driveitem,
+    shares-get, driveitem-get-content and driveitem-list-children (pages via nextLink)."""
+
+    def setUp(self):
+        self.files, self.folders, self.items = {}, {}, {}
+        self.download = {}
+
+        def routes(request):
+            path = request.path
+            if path.startswith("/download/"):
+                return 200, [], self.download[path.rsplit("/", 1)[1]]
+            if request.headers.get("Authorization") != "Bearer tok-valido":
+                return 401, [("Content-Type", "application/json")], json.dumps(
+                    {"error": {"code": "InvalidAuthenticationToken",
+                               "message": "Lifetime validation failed, the token is expired."}}).encode()
+            for prefix, table in (("/v1.0/drives/D/items/", self.items),):
+                if path.startswith(prefix):
+                    rest = path[len(prefix):]
+                    item_id, _, tail = rest.partition("/")
+                    if tail.startswith("children") and getattr(self, "escape", None):
+                        return 200, [], json.dumps({"value": [],
+                                                    "@odata.nextLink": self.escape}).encode()
+                    if tail.startswith("children"):
+                        pages = self.folders[item_id]
+                        page = int(tail.split("skiptoken=")[1]) if "skiptoken=" in tail else 0
+                        body = {"value": pages[page]}
+                        if page + 1 < len(pages):
+                            body["@odata.nextLink"] = (f"{self.base}/v1.0/drives/D/items/{item_id}"
+                                                       f"/children?$skiptoken={page + 1}")
+                        return 200, [], json.dumps(body).encode()
+                    return 200, [], json.dumps(table[item_id]).encode()
+            return 404, [], b"{}"
+
+        self.base, self.seen = self.serve(routes)
+        old = excel_filter.GRAPH
+        excel_filter.GRAPH = self.base + "/v1.0"
+        self.addCleanup(setattr, excel_filter, "GRAPH", old)
+        self.folder = Path(tempfile.mkdtemp()) / "base"
+
+    def file(self, item_id, name, line, tag, with_url=True, note="Gasser - alarme no dia {day}"):
+        """A file item as Graph lists it; its content has no planning sheet."""
+        self.download[item_id] = book_bytes(shift_book(line, None, note))
+        item = {"id": item_id, "name": name, "file": {}, "cTag": tag, "eTag": tag + "-e",
+                "parentReference": {"driveId": "D"},
+                "lastModifiedBy": {"user": {"displayName": "Ricardo"}}}
+        if with_url:
+            item["@microsoft.graph.downloadUrl"] = f"{self.base}/download/{item_id}"
+        self.items[item_id] = dict(item, **{"@microsoft.graph.downloadUrl":
+                                           f"{self.base}/download/{item_id}"})
+        return item
+
+    def october(self):
+        """2026 / 10 - Outubro: two pages, a line in a subfolder, a lock file, a .docx."""
+        self.items["OUT"] = {"id": "OUT", "name": "10 - Outubro", "folder": {"childCount": 5},
+                             "parentReference": {"driveId": "D",
+                                                 "path": "/drives/D/root:/General/2026"}}
+        self.items["L2F"] = {"id": "L2F", "name": "Linha 2", "folder": {"childCount": 1},
+                             "parentReference": {"driveId": "D"}}
+        self.folders["OUT"] = [
+            [self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"'),
+             {"id": "LCK", "name": "~$Relatório Linha 1.xlsx", "file": {}, "cTag": "x",
+              "parentReference": {"driveId": "D"}},
+             {"id": "DOC", "name": "Leia-me.docx", "file": {}, "cTag": "x",
+              "parentReference": {"driveId": "D"}},
+             self.items["L2F"]],
+            [self.file("L3", "Relatório Linha 3.xlsx", "D03", '"c:{3},1"', with_url=False)]]
+        self.folders["L2F"] = [[self.file("L2", "Relatório Linha 2.xlsx", "D02", '"c:{2},1"')]]
+
+    def downloads(self):
+        return [path for path, _ in self.seen if path.startswith("/download/")]
+
+    def test_a_single_file_key_reads_with_the_token_and_downloads_without_it(self):
+        self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"')
+        self.items["L1"]["parentReference"]["path"] = "/drives/D/root:/General/2026/10 - Outubro"
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("Relatório de Turno - Linha 1",
+                                "https://graph.microsoft.com/v1.0/drives/D/items/L1/content",
+                                self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder),
+                         [("Relatório de Turno - Linha 1", "Ricardo")])
+        self.assertEqual([e["key"] for e in excel_filter.base_entries(self.folder)], ["D01|2026-10"])
+        for path, headers in self.seen:
+            self.assertEqual("Authorization" in headers, path.startswith("/v1.0/"), path)
+
+    def test_a_folder_key_walks_every_line_and_takes_the_month_from_the_folders(self):
+        self.october()
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("outubro", "drives/D/items/OUT", self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "Ricardo")])
+        self.assertEqual(sorted(e["key"] for e in excel_filter.base_entries(self.folder)),
+                         ["D01|2026-10", "D02|2026-10", "D03|2026-10"])
+        self.assertEqual(sorted(self.downloads()), ["/download/L1", "/download/L2", "/download/L3"])
+        source = excel_filter.load_sources(self.folder)["sources"][0]
+        self.assertEqual((source["files"], source["problem"]), (3, ""))
+
+    def test_the_next_round_downloads_only_what_changed(self):
+        self.october()
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("outubro", "drives/D/items/OUT", self.folder)
+        excel_filter.sync_sources(self.folder)
+        before = len(self.downloads())
+        self.assertEqual(excel_filter.sync_sources(self.folder), [])
+        self.assertEqual(len(self.downloads()), before)  # nothing moved, nothing fetched
+        changed = self.file("L2", "Relatório Linha 2.xlsx", "D02", '"c:{2},2"',
+                            note="Tampadora - x = z no dia {day}")
+        self.folders["L2F"] = [[changed]]
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "Ricardo")])
+        self.assertEqual(self.downloads()[before:], ["/download/L2"])
+        back = excel_filter.base_load(self.folder)
+        at, line_at = back["headers"].index("Principais perdas"), back["headers"].index("Linha")
+        texts = {v[at] for _, v in back["rows"] if v[line_at] == "D02" and v[at]}
+        self.assertTrue(texts and all(t.startswith("Tampadora - x = z") for t in texts))
+
+    def test_testing_the_connection_lists_without_downloading_anything(self):
+        self.october()
+        said = excel_filter.probe_source(
+            "https://graph.microsoft.com/v1.0/drives/D/items/OUT/children", "tok-valido")
+        self.assertEqual(said[0], "Conectou na pasta 10 - Outubro: 3 planilha(s)")
+        self.assertIn("Relatório Linha 2.xlsx · 10/2026 · modificado por Ricardo", said)
+        self.assertEqual(self.downloads(), [])  # read only: no file left SharePoint
+        self.assertFalse(self.folder.exists())  # and nothing was saved
+
+    def test_testing_a_single_file_says_its_month_and_who_changed_it(self):
+        self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"')
+        self.items["L1"]["parentReference"]["path"] = "/drives/D/root:/General/2026/10 - Outubro"
+        said = excel_filter.probe_source("drives/D/items/L1", "tok-valido")
+        self.assertTrue(said[0].startswith("Conectou no arquivo Relatório Linha 1.xlsx · 10/2026"
+                                           " · modificado por Ricardo"))
+        self.assertEqual(self.downloads(), [])
+
+    def test_an_expired_token_is_said_as_such(self):
+        self.october()
+        with self.assertRaises(ValueError) as said:
+            excel_filter.check_source({"key": "drives/D/items/OUT"}, "tok-vencido", tempfile.mkdtemp())
+        self.assertIn("token expirou", str(said.exception))
+
+    def test_a_graph_key_without_a_token_says_it_needs_one(self):
+        with self.assertRaises(ValueError) as said:
+            excel_filter.check_source({"key": "drives/D/items/OUT"}, "", tempfile.mkdtemp())
+        self.assertIn("token", str(said.exception))
+
+    def test_the_token_never_follows_a_next_page_outside_graph(self):
+        self.items["ESC"] = {"id": "ESC", "name": "2026", "folder": {},
+                             "parentReference": {"driveId": "D"}}
+        self.escape = "http://127.0.0.2:9/roubar"  # a page that sends the walk elsewhere
+        with self.assertRaises(ValueError) as said:
+            excel_filter.check_source({"key": "drives/D/items/ESC"}, "tok-valido", tempfile.mkdtemp())
+        self.assertIn("fora do Graph", str(said.exception))
+
+
+class LiveSources(unittest.TestCase):
+    """The minute-by-minute check: only what changed goes into the base."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp()) / "base"
+        self.zip = shift_zip(Path(tempfile.mkdtemp()) / "outubro.zip", "D01", [(2026, 10)])
+
+    def texts(self):
+        back = excel_filter.base_load(self.folder)
+        at = back["headers"].index("Principais perdas")
+        return sorted({v[at] for _, v in back["rows"] if v[at]})
+
+    def test_a_file_in_a_synced_folder_feeds_the_base_and_then_only_its_changes(self):
+        excel_filter.add_source("outubro", str(self.zip), self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "")])
+        self.assertEqual(excel_filter.sync_sources(self.folder), [])  # nothing moved
+        rows = len(excel_filter.base_load(self.folder)["rows"])
+        shift_zip(self.zip, "D01", [(2026, 10)], note="Tampadora - x = z no dia {day}")
+        os.utime(self.zip, ns=(time.time_ns(), time.time_ns() + 5_000_000_000))
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "")])
+        self.assertEqual(len(excel_filter.base_load(self.folder)["rows"]), rows)  # replaced
+        self.assertTrue(all(text.startswith("Tampadora - x = z") for text in self.texts()))
+
+    def test_a_synced_year_folder_is_walked_with_the_month_from_its_names(self):
+        year = Path(tempfile.mkdtemp()) / "Relatórios de Turno - General" / "2026"
+        for line, month in (("D01", "10 - Outubro"), ("D02", "09 - Setembro")):
+            (year / month).mkdir(parents=True)
+            shift_book(line).save(year / month / f"Relatório Linha {line[-1]}.xlsx")
+        (year / "10 - Outubro" / "~$Relatório Linha 1.xlsx").write_bytes(b"lock")
+        excel_filter.add_source("2026", str(year), self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("2026", "")])
+        self.assertEqual(sorted(e["key"] for e in excel_filter.base_entries(self.folder)),
+                         ["D01|2026-10", "D02|2026-09"])
+
+    def test_testing_a_synced_folder_only_looks(self):
+        month = Path(tempfile.mkdtemp()) / "2026" / "10 - Outubro"
+        month.mkdir(parents=True)
+        shift_book("D01").save(month / "Relatório Linha 1.xlsx")
+        self.assertEqual(excel_filter.probe_source(str(month.parent)),
+                         ["Achei 1 planilha(s):", "Relatório Linha 1.xlsx · 10/2026"])
+        self.assertFalse(self.folder.exists())
+        with self.assertRaises(ValueError):
+            excel_filter.probe_source("drives/D/items/X")  # a Graph key needs the token
+
+    def test_one_broken_source_never_stops_the_others(self):
+        excel_filter.add_source("perdido", str(self.zip.with_name("nao-existe.zip")), self.folder)
+        excel_filter.add_source("outubro", str(self.zip), self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "")])
+        state = {s["label"]: s for s in excel_filter.load_sources(self.folder)["sources"]}
+        self.assertIn("não encontrado", state["perdido"]["problem"])
+        self.assertEqual(state["outubro"]["problem"], "")
+        self.assertTrue(state["outubro"]["versions"][""].startswith("arquivo:"))
+
+    def test_a_file_the_reader_cannot_open_is_tried_again(self):
+        broken = self.zip.with_name("quebrado.zip")
+        broken.write_bytes(b"PK\x03\x04 quebrado")
+        excel_filter.add_source("quebrado", str(broken), self.folder)
+        excel_filter.sync_sources(self.folder)
+        source = excel_filter.load_sources(self.folder)["sources"][0]
+        self.assertTrue(source["problem"])
+        self.assertEqual(source["versions"], {})  # nothing kept: the next round reads it again
+
+    def test_a_spreadsheet_that_is_not_a_report_is_set_aside_until_it_changes(self):
+        other = Path(tempfile.mkdtemp()) / "2026" / "10 - Outubro"
+        other.mkdir(parents=True)
+        plain = Workbook()
+        plain.active.append(["Data", "Valor"])
+        plain.active.append([date(2026, 10, 1), 3])
+        plain.save(other / "Plano de produção.xlsx")
+        excel_filter.add_source("outubro", str(other), self.folder)
+        excel_filter.sync_sources(self.folder)
+        source = excel_filter.load_sources(self.folder)["sources"][0]
+        self.assertEqual(source["problem"], "")
+        self.assertIn("Plano de produção.xlsx", next(iter(source["ignored"].values())))
+        self.assertIn("Plano de produção.xlsx", source["versions"])  # not re-read every minute
+
+    def test_sources_and_token_survive_and_a_broken_file_is_empty(self):
+        excel_filter.set_token("tok", self.folder)
+        state = excel_filter.add_source("outubro", "https://empresa.sharepoint.com/:x:/s/a/E",
+                                        self.folder)
+        self.assertEqual(excel_filter.load_sources(self.folder)["token"], "tok")
+        excel_filter.remove_source(state["sources"][0]["id"], self.folder)
+        self.assertEqual(excel_filter.load_sources(self.folder)["sources"], [])
+        (self.folder / excel_filter.SOURCES_FILE).write_text("[]")
+        self.assertEqual(excel_filter.load_sources(self.folder), {"token": "", "sources": []})
+        with self.assertRaises(ValueError):
+            excel_filter.add_source("vazio", "  ", self.folder)
