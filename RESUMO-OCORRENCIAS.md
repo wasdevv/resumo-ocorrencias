@@ -2,7 +2,7 @@
 
 App em Python (Tkinter + openpyxl) que lê os **Relatórios de Turno** em Excel e
 responde, com filtros, o que aconteceu na linha de produção: ocorrências por
-período, palavra-chave, hora e linha; e a produção por trás delas.
+período, palavra-chave, turno e linha; e a produção por trás delas.
 
 Entregue como **`.exe` único** para Windows (12 MB, sem instalação, sem Python na
 máquina de quem usa). Código em inglês, tela em português.
@@ -51,9 +51,13 @@ escolhido; sem item escolhido, limpa tudo.
 
 ## 3. A tela
 
+O app abre na aba **Produção**; Ocorrências é a segunda. Acima das abas fica só
+o período filtrado ("05/01/2026 a 31/08/2026").
+
 ### Aba Ocorrências
 
-Filtros: **data inicial / data final**, **hora**, **linhas** (chips com ✕) e
+Filtros: **data inicial / data final**, **turno** (1º 06h–14h, 2º 14h–22h, 3º
+22h–06h, pela hora em que a linha começa), **linhas** (chips com ✕) e
 **palavra-chave**. Todos se somam.
 
 - Palavra-chave é "contém", sem diferenciar maiúsculas; separando por vírgula,
@@ -84,13 +88,11 @@ Os mesmos filtros, vistos como números:
 
 Passar o mouse em qualquer barra mostra os números exatos.
 
-### Exportar Excel filtrado
+### Baixar Dados
 
-Grava uma cópia do `.xlsx` com o AutoFilter montado no topo da aba e as linhas
-que não casam **ocultas** — nada é apagado, limpar o filtro no Excel devolve
-tudo. Só o XML da aba é reescrito; imagens, fórmulas, formatação condicional,
-rótulo de confidencialidade e as outras abas são copiados byte a byte. Vale para
-planilha de tabela simples; o relatório de turno é montado das abas por dia.
+Botão embaixo de Filtrar: grava um `.xlsx` novo com **Linha, Data, Hora e
+Ocorrência** do que a aba Ocorrências mostra, cabeçalho congelado e filtro do
+Excel ligado. Com palavra-chave, só a frase que a contém.
 
 ---
 
@@ -119,7 +121,7 @@ pacote. Se ninguém disser o mês, a tela avisa em vez de fingir que leu.
 
 A célula de Principais Perdas costuma ser **mesclada** sobre várias horas: um
 relato que vale das 06h às 10h ocupa quatro linhas. O app mostra o período real
-("06h - 10h") e **filtra por qualquer hora de dentro dele**.
+("06h - 10h"); para o filtro de turno vale a hora em que ele começa.
 
 ### Versões do modelo
 

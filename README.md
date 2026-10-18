@@ -2,8 +2,8 @@
 
 App em Python (Tkinter) que lê a planilha de turno e mostra as ocorrências, com
 três filtros: **período** (data inicial / data final), **palavra-chave** e
-**hora**. Botão opcional grava uma cópia do `.xlsx` com o filtro montado no topo
-da aba e as linhas que não casam ocultas.
+**turno** (1º 06h–14h, 2º 14h–22h, 3º 22h–06h). **Baixar Dados** grava um
+`.xlsx` com Linha, Data, Hora e Ocorrência do que está filtrado.
 
 ```bash
 pip install -r requirements.txt
@@ -124,18 +124,16 @@ Linha com data ilegível interrompe dizendo o número da linha, em vez de sumir
 calada. Os valores lidos são os **calculados** — a coluna pode ser fórmula, como
 é o caso no relatório de turno.
 
-## Exportar Excel filtrado
+## Baixar Dados
 
-Nada é apagado: as linhas ficam ocultas e o critério fica montado no dropdown,
-então limpar o filtro no Excel devolve a planilha inteira. Só o XML da aba é
-reescrito; imagens, fórmulas, formatação condicional, rótulo de
-confidencialidade e as outras abas são copiados byte a byte (o teste prova isso
-comparando as partes do zip). O original nunca é aberto para escrita.
+Um `.xlsx` novo com quatro colunas — Linha, Data, Hora e Ocorrência — e uma
+linha por ocorrência que a aba Ocorrências está mostrando. Com palavra-chave, a
+ocorrência vem só com a frase que a contém. Coluna que a planilha não tem sai em
+branco, nunca inventada. A planilha original nunca é aberta para escrita.
+
+O turno é lido da hora em que cada linha **começa**: "13h - 14h" é 1º turno.
 
 ## Limites
 
-- Mais de 2 palavras: as linhas certas somem, mas o Excel só aceita 2 critérios
-  por coluna e o dropdown abre sem o critério montado (a tela avisa).
 - Só `.xlsx`; `.xls` e macros de `.xlsm` não passam pelo openpyxl.
-- Ler o arquivo de 59MB leva ~20s (uma vez só, os filtros depois são instantâneos);
-  exportar leva ~50s, quase tudo recompactando o zip.
+- Ler o arquivo de 59MB leva ~20s (uma vez só, os filtros depois são instantâneos).
