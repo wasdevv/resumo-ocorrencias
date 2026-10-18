@@ -1,4 +1,4 @@
-"""Shift-report summary: filter a spreadsheet by date range, keyword and hour.
+"""Shift-report summary: filter a spreadsheet by date range, keyword and shift.
 
 Code is English, the UI is pt-BR on purpose. Run with: python excel_filter.py
 """
@@ -17,16 +17,19 @@ from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "15/09 01:18"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "17/10 23:04"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 EXCEL_EPOCH = date(1899, 12, 30)
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
-NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+# shift -> (first hour, hour it ends); the third one crosses midnight
+SHIFTS = {1: (6, 14), 2: (14, 22), 3: (22, 6)}
+SHIFT_LABELS = {n: f"{n}º turno ({a:02d}h às {b:02d}h)" for n, (a, b) in SHIFTS.items()}
+NS_MAIN ="{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 NS_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 # elements that sit between </sheetData> and <autoFilter> in the schema
 BEFORE_AUTOFILTER = (b"sheetCalcPr", b"sheetProtection", b"protectedRanges", b"scenarios")
@@ -43,6 +46,21 @@ def parse_date(value):
             return datetime.strptime(str(value).strip(), fmt).date()
         except ValueError:
             pass
+    return None
+
+
+def shift_of(hour_text):
+    """"06h - 07h" -> 1, "15:00" -> 2, "23h - 00h" -> 3; None when no hour can be read.
+
+    Goes by the hour the slot STARTS at: "13h - 14h" is still the first shift.
+    """
+    found = re.search(r"\d{1,2}", str(hour_text or ""))
+    if not found or int(found.group()) > 23:
+        return None
+    hour = int(found.group())
+    for number, (first, until) in SHIFTS.items():
+        if (first <= hour < until) if first < until else (hour >= first or hour < until):
+            return number
     return None
 
 
@@ -573,22 +591,25 @@ def _column_index(headers, name):
     return found[0]
 
 
-def _matcher(headers, text_col, terms, date_col, start, end, hour_col, hour,
+def _matcher(headers, text_col, terms, date_col, start, end, hour_col, shift,
              line_col=None, lines=()):
-    """One sieve, used by the summary and by the export — never two rulesets."""
+    """One sieve, used by the summary and by the export — never two rulesets.
+
+    `shift` is 1, 2 or 3 (see SHIFTS), read from the hour column of each row.
+    """
     if start and end and start > end:
         raise ValueError("Data inicial maior que a data final.")
     if terms and not text_col:
         raise ValueError("A planilha não tem uma coluna de texto para procurar a palavra.")
     if (start or end) and not date_col:
         raise ValueError("A planilha não tem uma coluna de data.")
-    if hour and not hour_col:
-        raise ValueError("A planilha não tem uma coluna de hora.")
+    if shift and not hour_col:
+        raise ValueError("A planilha não tem uma coluna de hora para saber o turno.")
     if lines and not line_col:
         raise ValueError("A planilha não diz a linha de produção.")
     ti = _column_index(headers, text_col) - 1 if terms else None
     di = _column_index(headers, date_col) - 1 if (start or end) else None
-    hi = _column_index(headers, hour_col) - 1 if hour else None
+    hi = _column_index(headers, hour_col) - 1 if shift else None
     li = _column_index(headers, line_col) - 1 if lines else None
     wanted = {str(l).strip().casefold() for l in lines}
 
@@ -601,7 +622,7 @@ def _matcher(headers, text_col, terms, date_col, start, end, hour_col, hour,
                 return False
         if hi is not None:
             value = values[hi]
-            if value is None or hour.casefold() not in str(value).casefold():
+            if shift_of(value) != shift:
                 return False
         if di is not None:
             raw = values[di]
@@ -648,7 +669,7 @@ def _summable(values):
 
 
 def summarize(headers, rows, text_col=None, terms=(), date_col=None, start=None, end=None,
-              hour_col=None, hour=None, line_col=None, lines=(), only_with_text=False):
+              hour_col=None, shift=None, line_col=None, lines=(), only_with_text=False):
     """Summary of the rows passing the filters.
 
     Returns the columns that carry content (empty ones are dropped), the matching
@@ -656,7 +677,7 @@ def summarize(headers, rows, text_col=None, terms=(), date_col=None, start=None,
     at all is valid: it summarises the whole sheet.
     """
     terms = [t.strip().casefold() for t in terms if t.strip()]
-    matches, *_ = _matcher(headers, text_col, terms, date_col, start, end, hour_col, hour,
+    matches, *_ = _matcher(headers, text_col, terms, date_col, start, end, hour_col, shift,
                            line_col, lines)
     ti = _column_index(headers, text_col) - 1 if (only_with_text and text_col) else None
     di = _column_index(headers, date_col) - 1 if date_col else None
@@ -730,7 +751,7 @@ def _patch_sheet(xml, ref, hidden, criteria):
 
 
 def export(src, dst, sheet, headers, rows, text_col=None, terms=(), date_col=None, start=None,
-           end=None, hour_col=None, hour=None, line_col=None, lines=()):
+           end=None, hour_col=None, shift=None, line_col=None, lines=()):
     """Copy of the .xlsx with AutoFilter on top of the sheet and non-matching rows hidden.
 
     Nothing is deleted: clearing the filter in Excel brings everything back. Only
@@ -741,7 +762,7 @@ def export(src, dst, sheet, headers, rows, text_col=None, terms=(), date_col=Non
         raise ValueError("O destino não pode ser o arquivo de origem.")
     terms = [t.strip().casefold() for t in terms if t.strip()]
     matches, ti, di, hi = _matcher(headers, text_col, terms, date_col, start, end, hour_col,
-                                   hour, line_col, lines)
+                                   shift, line_col, lines)
 
     visible = {r for r, v in rows if matches(r, v)}
     last = max(r for r, _ in rows)
@@ -753,8 +774,8 @@ def export(src, dst, sheet, headers, rows, text_col=None, terms=(), date_col=Non
             criteria.append(_filter_column(ti, [("equal", f"*{t}*") for t in terms], match_all=False))
         else:
             exact = False
-    if hi is not None:
-        criteria.append(f'<filterColumn colId="{hi}"><filters><filter val="{hour}"/></filters></filterColumn>')
+    if hi is not None:  # a shift is a range of hours Excel cannot express: rows stay hidden
+        exact = False
     if di is not None:
         bounds = [("greaterThanOrEqual", (start - EXCEL_EPOCH).days) if start else None,
                   ("lessThanOrEqual", (end - EXCEL_EPOCH).days) if end else None]
@@ -769,6 +790,33 @@ def export(src, dst, sheet, headers, rows, text_col=None, terms=(), date_col=Non
                 data = _patch_sheet(data, ref, hidden, criteria)
             zout.writestr(item, data)
     return len(visible), exact
+
+
+def download(dst, headers, rows, line_col, date_col, hour_col, text_col, terms=()):
+    """New .xlsx with just Linha, Data, Hora and Ocorrência of the given rows.
+
+    The occurrence is what the screen shows: with a keyword, only the sentences
+    that carry it. A column the sheet does not have comes out blank, never invented.
+    """
+    terms = [t.strip().casefold() for t in terms if t.strip()]
+    at = [_at(headers, c) if c else None for c in (line_col, date_col, hour_col, text_col)]
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Ocorrências"
+    sheet.append(["Linha", "Data", "Hora", "Ocorrência"])
+    for _, values in rows:
+        line, day, hour, text = (values[i] if i is not None else None for i in at)
+        day = parse_date(day) if day is not None else None
+        sheet.append([show(line), day, show(hour),
+                      sentences_with(text, terms) if text is not None else ""])
+    for row in sheet.iter_rows(min_row=2, min_col=2, max_col=2):
+        row[0].number_format = "DD/MM/YYYY"
+    for column, width in zip("ABCD", (10, 12, 16, 100)):
+        sheet.column_dimensions[column].width = width
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    book.save(dst)
+    return len(rows)
 
 
 def thousands(value):
@@ -1291,11 +1339,12 @@ def main(path=None):
 
     ttk.Label(top, text="Data inicial (dd/mm/aaaa)").grid(row=3, column=0, sticky="w", pady=(10, 0))
     ttk.Label(top, text="Data final").grid(row=3, column=1, sticky="w", pady=(10, 0))
-    ttk.Label(top, text="Hora").grid(row=3, column=2, sticky="w", pady=(10, 0))
+    ttk.Label(top, text="Turno").grid(row=3, column=2, sticky="w", pady=(10, 0))
 
     first = ttk.Entry(top, textvariable=start_date, width=16, state="disabled")
     last = ttk.Entry(top, textvariable=end_date, width=16, state="disabled")
-    hour_box = ttk.Combobox(top, textvariable=hour, width=16, state="disabled")
+    hour_box = ttk.Combobox(top, textvariable=hour, width=22, state="disabled",
+                            values=["todos"] + list(SHIFT_LABELS.values()))
 
     first.grid(row=4, column=0, sticky="w", padx=(0, 8))
     last.grid(row=4, column=1, sticky="w", padx=(0, 8))
@@ -1316,7 +1365,10 @@ def main(path=None):
     words = ttk.Entry(top, textvariable=keyword, state="disabled")
     words.grid(row=6, column=0, columnspan=5, sticky="we")
     filter_button = ttk.Button(top, text="Filtrar", command=lambda: refresh(), state="disabled")
-    filter_button.grid(row=6, column=5, padx=(8, 0))
+    filter_button.grid(row=6, column=5, padx=(8, 0), sticky="we")
+    download_button = ttk.Button(top, text="Baixar Dados", command=lambda: download_file(),
+                                 state="disabled")
+    download_button.grid(row=7, column=5, padx=(8, 0), pady=(4, 0), sticky="we")
     top.columnconfigure(4, weight=1)
 
     headline = ttk.Label(root, textvariable=summary, padding=(12, 6),
@@ -1457,7 +1509,7 @@ def main(path=None):
         source.set(f"Lendo {Path(chosen).name}...")
         say("Lendo em segundo plano — a janela continua respondendo.")
         book["reading"], book["adding"] = True, add
-        for widget in (first, last, words, filter_button, export_button):
+        for widget in (first, last, words, filter_button, export_button, download_button):
             widget.state(["disabled"])
         news = queue.Queue()
 
@@ -1482,7 +1534,7 @@ def main(path=None):
                 root.after(50, poll)
                 return
             book["reading"] = False
-            for widget in (first, last, words, filter_button, export_button):
+            for widget in (first, last, words, filter_button, export_button, download_button):
                 widget.state(["!disabled"])
             if kind == "erro":
                 source.set("Nenhuma planilha aberta")
@@ -1540,21 +1592,17 @@ def main(path=None):
                                   text_col=book["text"])
         book["whole"]["with_text"] = summarize(book["headers"], book["rows"],
                                                text_col=book["text"], only_with_text=True)["found"]
-        # "Horas" holds every hour an occurrence covers; the picker offers them one by one
-        found_hours = sorted({h.strip() for value in
-                              (distinct(book["headers"], book["rows"], book["hour"]) if book["hour"] else [])
-                              for h in value.split("|")})
-        hour_box["values"] = [""] + [h for h in found_hours if HOUR_RE.fullmatch(h)]
         book["lines"] = (distinct(book["headers"], book["rows"], picked["line"])
                          if picked.get("line") else [])
         book["chosen"] = []
         line_box.configure(state="readonly" if book["lines"] else "disabled")
         redraw()
-        for field in (start_date, end_date, hour, keyword):
+        for field in (start_date, end_date, keyword):
             field.set("")
-        for widget in (first, last, words, filter_button, export_button):
+        hour.set("todos")
+        for widget in (first, last, words, filter_button, export_button, download_button):
             widget.state(["!disabled"])
-        hour_box.configure(state="readonly")
+        hour_box.configure(state="readonly" if book["hour"] else "disabled")
         if not add:
             show_history(remember(chosen, {"rows": len(data["rows"]), "month": data["month"]}))
         refresh()
@@ -1611,7 +1659,8 @@ def main(path=None):
     def filters():
         return dict(text_col=book["text"], terms=terms(), date_col=book["date"],
                     start=as_date(start_date.get()), end=as_date(end_date.get()),
-                    hour_col=book["hour"], hour=hour.get().strip(),
+                    hour_col=book["hour"],
+                    shift=next((n for n, label in SHIFT_LABELS.items() if label == hour.get()), None),
                     line_col=book.get("line", ""), lines=chosen_lines())
 
     def refresh(event=None):
@@ -1654,14 +1703,8 @@ def main(path=None):
 
         draw_board(hours_result)
 
-        whole = book["whole"]
-        totals = "   ".join(
-            "{}: {}{} de {}".format(name, thousands(value), "+" if name in result["partial"] else "",
-                                    thousands(whole["totals"].get(name, 0)))
-            for name, value in result["totals"].items())
-        period = " · {} a {}".format(*map(show, result["period"])) if result["period"] else ""
-        summary.set(f"{result['found']} ocorrências de {whole['found']} linhas da planilha"
-                    f" ({whole['with_text']} têm ocorrência escrita){period}\n{totals}")
+        summary.set("{} a {}".format(*map(show, result["period"])) if result["period"]
+                    else "Nenhuma data no filtro")
         say(book.pop("just_loaded", None)
             or "Com palavra-chave, só a frase que a contém aparece. Enter refiltra.")
 
@@ -1844,8 +1887,28 @@ def main(path=None):
             root.update()
             visible, exact = export(book["path"], target, book["sheet"],
                                     book["headers"], book["rows"], **filters())
-            warning = "" if exact else " — mais de 2 palavras: o filtro do Excel abre sem o critério"
+            warning = "" if exact else (" — turno ou mais de 2 palavras: o filtro do Excel abre"
+                                        " sem esse critério, mas as linhas já vêm ocultas")
             say(f"{visible} linhas visíveis em {target}{warning}", "#1b7a3d")
+        except Exception as error:
+            say(f"Erro: {error}", "#b00020")
+
+    def download_file():
+        """Linha, Data, Hora and Ocorrência of what the Ocorrências tab is showing."""
+        if not book["rows"]:
+            return
+        try:
+            chosen = filters()
+            found = summarize(book["headers"], book["rows"], only_with_text=True, **chosen)
+            target = filedialog.asksaveasfilename(
+                defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+                initialfile="ocorrencias.xlsx", initialdir=start_dir())
+            if not target:
+                return
+            written = download(target, book["headers"], found["matched"], book.get("line", ""),
+                               book["date"], book["label"] or book["hour"], book["text"],
+                               chosen["terms"])
+            say(f"{written} ocorrências gravadas em {target}", "#1b7a3d")
         except Exception as error:
             say(f"Erro: {error}", "#b00020")
 
