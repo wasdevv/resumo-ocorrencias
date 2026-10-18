@@ -70,23 +70,24 @@ Filtros: **data inicial / data final**, **turno** (1º 06h–14h, 2º 14h–22h,
 
 ### Aba Produção
 
-Os mesmos filtros, vistos como números:
+Os mesmos filtros, vistos como números, em painéis escuros:
 
-- **Tiles**: planejado, produzido, faltou, % atingido, linhas de ocorrência.
-- **Produzido**: barra = produzido, **linha azul = planejado**; verde bateu o
-  plano, vermelho ficou abaixo, **cinza = plano não anotado**. A granularidade se
-  ajusta sozinha: um dia → por hora; até 120 barras → por hora ao longo dos dias;
-  até 31 dias → por dia; acima disso → por mês. **Clicar numa barra abre o nível
-  de baixo** (mês → dias → horas).
-- **Tempo de troca (changeover)** por dia ou mês, com o total no título.
-- **Ocorrências por equipamento**: cada linha do relato começa com a máquina
-  ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca; **clicar leva
-  para as ocorrências daquele equipamento**, já filtradas.
-- **SKU e changeover por dia**: o SKU inicial do dia e, a cada troca, "houve um
-  changeover 08h - 09h (31m19s) · passa a 64830874". Com três trocas, chega ao
-  terceiro SKU.
+- **Tiles**: planejado, produzido, faltou (laranja quando falta), % atingido,
+  linhas de ocorrência.
+- **Tempo de troca (changeover) e produção por dia**, num gráfico só: em cima,
+  as barras de minutos de changeover; embaixo, numa faixa, a produção do dia —
+  azul bateu o plano, laranja ficou abaixo, ardósia sem plano anotado — com a
+  marca branca no plano. Acima de 31 dias o eixo vira mês. **Clicar num dia** o
+  destaca e leva o painel do lado até ele; **duplo clique** filtra só aquele dia.
+- **SKU e changeover por dia**, lado a lado com o gráfico: o SKU inicial do dia
+  e, a cada troca, "houve um changeover 08h - 09h (31m19s) · passa a 64830874".
+  Com três trocas, chega ao terceiro SKU.
+- **Ocorrências por equipamento**, embaixo: cada linha do relato começa com a
+  máquina ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca;
+  **clicar leva para as ocorrências daquele equipamento**, já filtradas.
 
-Passar o mouse em qualquer barra mostra os números exatos.
+Passar o mouse num dia mostra changeover, produzido, plano e % exatos. A janela
+abre maximizada.
 
 ### Baixar Dados
 

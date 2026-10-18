@@ -21,7 +21,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "17/10 23:41"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 00:30"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -1049,95 +1049,126 @@ def merge(datasets):
             "sources": sources}
 
 
-def draw_day_chart(canvas, days, over="#2e7d32", under="#c62828", target="#1565c0",
-                   unknown="#9aa7bd"):
-    """One bar per day: what was produced, against the planned line.
+# the Produção tab is dark, after the reference panel chosen for it
+BOARD_COLOURS = {"bg": "#111418", "card": "#1a1e24", "grid": "#2a3038", "text": "#e8ebef",
+                 "muted": "#8b95a3", "hit": "#8ab8f0", "miss": "#c8601a", "plan": "#ffffff",
+                 "swap": "#7d8794", "unknown": "#4a5361", "select": "#22344a"}
 
-    Green when production reached the plan, red when it fell short, and a blue
-    line at the planned level — a bar taller than the line produced above plan.
+
+def chart_columns(numbers):
+    """([(day, changeover minutes, planned, produced)], monthly) on one shared axis.
+
+    More than 31 days goes monthly: a picket fence of bars reads as nothing.
+    """
+    monthly = len(numbers["dias"]) > 31
+    swaps = {}
+    for day, minutes in numbers["trocas_por_dia"]:
+        key = day.replace(day=1) if monthly else day
+        swaps[key] = swaps.get(key, 0) + minutes
+    made = numbers["meses"] if monthly else numbers["dias"]
+    return [(when, swaps.get(when, 0), planned, produced)
+            for when, planned, produced in made], monthly
+
+
+def _short(value):
+    """50000 -> "50 mil", 1123000 -> "1,1 mi": the way the axis reads aloud."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f} mi".replace(".", ",")
+    return f"{value / 1000:.0f} mil" if value >= 1000 else f"{value:.0f}"
+
+
+def _minutes(value):
+    """Axis label for changeover: minutes, or hours once minutes get long."""
+    return f"{value / 60:.0f} h" if value >= 600 else f"{value:.0f} min"
+
+
+def draw_combo_chart(canvas, columns, monthly=False, selected=None, colours=None):
+    """Changeover per day on top, production per day in a strip below, one axis.
+
+    The changeover is the headline: bars of minutes. Under it each day's
+    production is blue when it reached the plan, orange when it fell short and
+    slate when nobody wrote a plan down; the white tick is the plan. Every column
+    is tagged "slot<i>" so the mouse finds it; `selected` gets a highlight behind.
 
     ponytail: tk.Canvas instead of matplotlib, a dependency that triples the .exe
     to draw rectangles. Swap it the day these charts need axes, zoom or export.
     """
+    c = {**BOARD_COLOURS, **(colours or {})}
     canvas.delete("all")
-    width = max(canvas.winfo_width(), 200)
-    height = max(canvas.winfo_height(), 120)
-    if not days:
-        canvas.create_text(width / 2, height / 2, text="Sem dados no filtro", fill="#777")
+    width = max(canvas.winfo_width(), 300)
+    height = max(canvas.winfo_height(), 200)
+    if not columns:
+        canvas.create_text(width / 2, height / 2, text="Sem dados no filtro", fill=c["muted"])
         return
-    top, floor, left = 14, height - 22, 44
-    ceiling = max(max(planned or 0, produced) for _, planned, produced in days) or 1
-    step = (width - left - 10) / len(days)
-
-    def y_of(value):
-        return floor - (value / ceiling) * (floor - top)
-
-    for value in (0, ceiling / 2, ceiling):  # three reference lines, with their numbers
-        canvas.create_line(left, y_of(value), width - 8, y_of(value), fill="#e6e8ec")
-        canvas.create_text(left - 6, y_of(value), text=f"{value / 1000:.0f}k" if value else "0",
-                           anchor="e", fill="#777", font=("TkDefaultFont", 7))
-    # every label is the first of a month: this is a monthly series, not a daily one
-    month_series = all(hasattr(d, "day") and d.day == 1 for d, *_ in days) and len(days) > 1
-    previous = None
-    for i, (day, planned, produced) in enumerate(days):
-        x = left + i * step
-        if isinstance(day, tuple):  # (dia, hora): o dia só aparece quando vira
-            label, previous = (f"{day[0].day:02d}" if day[0] != previous else ""), day[0]
-            if label and i:
-                canvas.create_line(x, top, x, floor, fill="#e6e8ec")
-        elif hasattr(day, "day"):
-            label = f"{day.day:02d}" if not month_series else day.strftime("%m/%y")
+    small = ("TkDefaultFont", 8)
+    x = 60
+    for name, colour, line in (("Changeover", c["swap"], False), ("Bateu o plano", c["hit"], False),
+                               ("Abaixo do plano", c["miss"], False),
+                               ("Plano", c["plan"], True), ("Sem plano", c["unknown"], False)):
+        if line:
+            canvas.create_line(x, 13, x + 14, 13, fill=colour, width=3)
         else:
-            label = str(day).split("-")[0].strip()
-        wide = min(max(step * 0.62, 2), 54)
-        middle = x + (step - wide) / 2
-        paint = unknown if planned is None else (over if produced >= planned else under)
-        canvas.create_rectangle(middle, y_of(produced), middle + wide, floor,
-                                fill=paint, width=0, tags=("slot", f"slot{i}"))
-        if planned:
-            canvas.create_line(x + 1, y_of(planned), x + step - 1, y_of(planned),
-                               fill=target, width=3)
-        if label and len(days) <= 200:
-            canvas.create_text(x + step / 2, floor + 7, text=label, fill="#777",
-                               font=("TkDefaultFont", 7))
-        # invisible column so the whole slot answers the mouse, not only the bar
-        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="",
-                                tags=("slot", f"slot{i}"))
+            canvas.create_rectangle(x, 7, x + 12, 19, fill=colour, width=0)
+        x = canvas.bbox(canvas.create_text(x + 18, 13, text=name, anchor="w", fill=c["muted"],
+                                           font=small))[2] + 16
 
+    left, right, top = 60, width - 10, 36
+    floor = height - 22  # production floor; the day labels sit under it
+    swap_floor = top + (floor - top) * 0.6
+    strip_top = swap_floor + 26
+    step = (right - left) / len(columns)
+    swap_ceiling = max(minutes for _, minutes, _, _ in columns) or 1
+    made_ceiling = max(max(planned or 0, produced) for _, _, planned, produced in columns) or 1
 
-def draw_time_chart(canvas, series, colour="#8a5a00"):
-    """One bar per slot for a single number — here, minutes of changeover."""
-    canvas.delete("all")
-    width = max(canvas.winfo_width(), 200)
-    height = max(canvas.winfo_height(), 90)
-    if not series or not any(value for _, value in series):
-        canvas.create_text(width / 2, height / 2, text="Sem troca no filtro", fill="#777")
-        return
-    top, floor, left = 10, height - 18, 44
-    ceiling = max(value for _, value in series) or 1
-    step = (width - left - 10) / len(series)
-    for mark in (0, ceiling):
-        y = floor - (mark / ceiling) * (floor - top)
-        canvas.create_line(left, y, width - 8, y, fill="#e6e8ec")
-        canvas.create_text(left - 6, y, text=f"{mark:.0f}min", anchor="e", fill="#777",
-                           font=("TkDefaultFont", 7))
-    month_series = all(hasattr(label, "day") and label.day == 1 for label, _ in series) \
-        and len(series) > 1
-    for i, (label, value) in enumerate(series):
+    def y_swap(value):
+        return swap_floor - value / swap_ceiling * (swap_floor - top)
+
+    def y_made(value):
+        return floor - value / made_ceiling * (floor - strip_top)
+
+    if selected is not None and 0 <= selected < len(columns):
+        canvas.create_rectangle(left + selected * step, top - 6, left + (selected + 1) * step,
+                                height - 2, fill=c["select"], width=0)
+    for value in (0, swap_ceiling / 2, swap_ceiling):
+        canvas.create_line(left, y_swap(value), right, y_swap(value), fill=c["grid"], dash=(2, 3))
+        canvas.create_text(left - 6, y_swap(value), text=_minutes(value), anchor="e",
+                           fill=c["muted"], font=small)
+    canvas.create_text(left + 4, swap_floor + 13, anchor="w", fill=c["muted"],
+                       text="Produção por " + ("mês" if monthly else "dia"),
+                       font=("TkDefaultFont", 8, "bold"))
+    for value in (0, made_ceiling):
+        canvas.create_line(left, y_made(value), right, y_made(value), fill=c["grid"], dash=(2, 3))
+        canvas.create_text(left - 6, y_made(value), text=_short(value), anchor="e",
+                           fill=c["muted"], font=small)
+    every = max(1, int(-(-24 // step)))  # labels never collide, however many days
+    wide = min(max(step * 0.62, 2), 40)
+    for i, (when, minutes, planned, produced) in enumerate(columns):
         x = left + i * step
-        wide = min(max(step * 0.62, 2), 54)
-        y = floor - (value / ceiling) * (floor - top)
-        canvas.create_rectangle(x + (step - wide) / 2, y, x + (step - wide) / 2 + wide, floor,
-                                fill=colour, width=0, tags=("slot", f"slot{i}"))
-        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="",
-                                tags=("slot", f"slot{i}"))
-        if len(series) <= 31 and hasattr(label, "day"):
-            canvas.create_text(x + step / 2, floor + 7,
-                               text=label.strftime("%m/%y") if month_series else f"{label.day:02d}",
-                               fill="#777", font=("TkDefaultFont", 7))
+        middle = x + (step - wide) / 2
+        tags = ("slot", f"slot{i}")
+        if minutes:
+            canvas.create_rectangle(middle, y_swap(minutes), middle + wide, swap_floor,
+                                    fill=c["swap"], width=0, tags=tags)
+        if produced:
+            paint = (c["unknown"] if planned is None
+                     else c["hit"] if produced >= planned else c["miss"])
+            canvas.create_rectangle(middle, y_made(produced), middle + wide, floor,
+                                    fill=paint, width=0, tags=tags)
+        if planned:
+            canvas.create_line(x + 1, y_made(planned), x + step - 1, y_made(planned),
+                               fill=c["plan"], width=2, tags=tags)
+        if i % every == 0 or i == selected:
+            on = i == selected
+            canvas.create_text(x + step / 2, height - 11,
+                               text=when.strftime("%m/%y") if monthly else f"{when.day:02d}",
+                               fill=c["text"] if on else c["muted"],
+                               font=("TkDefaultFont", 8, "bold" if on else "normal"))
+        # invisible column so the whole day answers the mouse, not only the bars
+        canvas.create_rectangle(x, top, x + step, floor, outline="", fill="", tags=tags)
 
 
-def draw_rank_chart(canvas, items, colour="#c62828", highlight=None):
+def draw_rank_chart(canvas, items, colour="#c62828", highlight=None, ink="black",
+                    quiet="#444", strong="#8e1b1b"):
     """Horizontal bars: how many times each machine shows up in the period.
 
     Each bar is tagged "bar<i>" so the screen can tell which machine the mouse is
@@ -1156,12 +1187,12 @@ def draw_rank_chart(canvas, items, colour="#c62828", highlight=None):
         tag = f"bar{i}"
         on = i == highlight
         canvas.create_text(label_width - 6, y, text=name[:26], anchor="e", tags=("bar", tag),
-                           font=("TkDefaultFont", 8, "bold" if on else "normal"))
+                           fill=ink, font=("TkDefaultFont", 8, "bold" if on else "normal"))
         long = (count / ceiling) * (width - label_width - 46)
         canvas.create_rectangle(label_width, y - step / 3, label_width + long, y + step / 3,
-                                fill="#8e1b1b" if on else colour, width=0, tags=("bar", tag))
+                                fill=strong if on else colour, width=0, tags=("bar", tag))
         canvas.create_text(label_width + long + 6, y, text=str(count), anchor="w",
-                           font=("TkDefaultFont", 8), fill="#444", tags=("bar", tag))
+                           font=("TkDefaultFont", 8), fill=quiet, tags=("bar", tag))
         # invisible strip so the whole row answers the mouse, not just the bar
         canvas.create_rectangle(0, y - step / 2, width, y + step / 2, outline="", fill="",
                                 tags=("bar", tag))
@@ -1232,7 +1263,11 @@ def main(path=None):
     style = ttk.Style()
     style.map("TCombobox", fieldbackground=[("readonly", "white")],
               selectbackground=[("readonly", "white")], selectforeground=[("readonly", "black")])
-    root.geometry("1040x700")
+    root.geometry("1280x900")
+    try:  # the board needs the room: open maximised where the platform knows how
+        root.state("zoomed")
+    except tk.TclError:
+        pass
     book = {"path": "", "headers": [], "rows": [], "date": "", "hour": "", "text": "",
             "whole": None, "lines": [], "chosen": []}
 
@@ -1315,58 +1350,70 @@ def main(path=None):
     listing.tag_config("line", font=("TkDefaultFont", 11, "bold"), foreground="#123",
                        spacing1=8, spacing3=6)
 
-    board = ttk.Frame(tabs, padding=(10, 8, 10, 8))
+    dark = BOARD_COLOURS
+    board = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.insert(0, board, text="  Produção  ")  # the main screen: it opens here
     tabs.select(board)
-    tiles = ttk.Frame(board)
+
+    def card(parent, title):
+        """Dark panel with a bold title, like the rest of the board."""
+        box = tk.Frame(parent, background=dark["card"], padx=14, pady=10,
+                       highlightthickness=1, highlightbackground=dark["grid"])
+        heading = tk.Label(box, background=dark["card"], foreground=dark["text"],
+                           font=("TkDefaultFont", 11, "bold"), anchor="w",
+                           **({"textvariable": title} if isinstance(title, tk.StringVar)
+                              else {"text": title}))
+        heading.pack(fill="x", pady=(0, 6))
+        return box
+
+    tiles = tk.Frame(board, background=dark["bg"])
     tiles.pack(fill="x")
     tile_values = {}
     for i, (key, caption) in enumerate((("plan", "Planejado"), ("produzido", "Produzido"),
                                         ("faltou", "Faltou"), ("atingido", "Atingido"),
                                         ("ocorrencias", "Linhas de ocorrência"))):
-        cell = tk.Frame(tiles, background="#eef1f6", padx=14, pady=8)
-        cell.grid(row=0, column=i, sticky="we", padx=(0, 6))
+        cell = tk.Frame(tiles, background=dark["card"], padx=14, pady=8,
+                        highlightthickness=1, highlightbackground=dark["grid"])
+        cell.grid(row=0, column=i, sticky="we", padx=(0 if i == 0 else 8, 0))
         tiles.columnconfigure(i, weight=1)
-        tile_values[key] = tk.Label(cell, text="—", background="#eef1f6",
-                                    font=("TkDefaultFont", 14, "bold"))
+        tk.Label(cell, text=caption, background=dark["card"],
+                 foreground=dark["muted"]).pack(anchor="w")
+        tile_values[key] = tk.Label(cell, text="—", background=dark["card"],
+                                    foreground=dark["text"], font=("TkDefaultFont", 15, "bold"))
         tile_values[key].pack(anchor="w")
-        tk.Label(cell, text=caption, background="#eef1f6", foreground="#666").pack(anchor="w")
 
-    board_title = tk.StringVar(value="Produzido por dia   (linha azul: planejado ·"
-                                     " verde bateu o plano · vermelho ficou abaixo)")
-    ttk.Label(board, textvariable=board_title, foreground="#444").pack(anchor="w", pady=(12, 2))
-    day_chart = tk.Canvas(board, height=170, background="white", highlightthickness=1,
-                          highlightbackground="#dfe3ea")
-    day_chart.pack(fill="x")
+    # changeover chart and the SKU/changeover list side by side, machines below
+    pair = tk.Frame(board, background=dark["bg"])
+    pair.pack(fill="both", expand=True, pady=(10, 0))
+    pair.columnconfigure(0, weight=1)
+    pair.rowconfigure(0, weight=1)
+    chart_title = tk.StringVar(value="Tempo de troca (changeover) e produção por dia")
+    chart_card = card(pair, chart_title)
+    chart_card.grid(row=0, column=0, sticky="nsew")
+    day_chart = tk.Canvas(chart_card, height=260, background=dark["card"], highlightthickness=0)
+    day_chart.pack(fill="both", expand=True)
+    tk.Label(chart_card, background=dark["card"], foreground=dark["muted"], anchor="w",
+             text="Clique num dia para ver o SKU e as trocas dele ao lado · "
+                  "duplo clique filtra só esse dia").pack(fill="x", pady=(6, 0))
 
-    swap_title = tk.StringVar(value="Tempo de troca (changeover) por dia")
-    ttk.Label(board, textvariable=swap_title, foreground="#444").pack(anchor="w", pady=(10, 2))
-    swap_chart = tk.Canvas(board, height=96, background="white", highlightthickness=1,
-                           highlightbackground="#dfe3ea")
-    swap_chart.pack(fill="x")
-
-    middle = ttk.Frame(board)
-    middle.pack(fill="both", expand=True, pady=(12, 0))
-    left_side = ttk.Frame(middle)
-    left_side.pack(side="left", fill="both", expand=True)
-    ttk.Label(left_side, text="Ocorrências por equipamento no período",
-              foreground="#444").pack(anchor="w", pady=(0, 2))
-    rank_chart = tk.Canvas(left_side, background="white", highlightthickness=1,
-                           highlightbackground="#dfe3ea")
-    rank_chart.pack(fill="both", expand=True)
-
-    right_side = ttk.Frame(middle, width=430)
-    right_side.pack(side="right", fill="y", padx=(12, 0))
-    right_side.pack_propagate(False)
     sku_title = tk.StringVar(value="SKU e changeover por dia")
-    ttk.Label(right_side, textvariable=sku_title, foreground="#444").pack(anchor="w", pady=(0, 2))
-    sku_list = tk.Text(right_side, wrap="word", width=50, padx=8, pady=6, state="disabled",
-                       background="white", highlightthickness=1, highlightbackground="#dfe3ea")
+    sku_card = card(pair, sku_title)
+    sku_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    sku_list = tk.Text(sku_card, wrap="word", width=52, height=14, padx=4, pady=2,
+                       font=("TkDefaultFont", 9),
+                       state="disabled", background=dark["card"], foreground=dark["text"],
+                       relief="flat", highlightthickness=0, cursor="arrow")
     sku_list.pack(fill="both", expand=True)
-    sku_list.tag_config("day", font=("TkDefaultFont", 10, "bold"), spacing1=4)
-    sku_list.tag_config("code", font=("TkDefaultFont", 9, "bold"), foreground="#1a4d80")
-    sku_list.tag_config("swap", foreground="#8a5a00")
-    sku_list.tag_config("quiet", foreground="#888")
+    sku_list.tag_config("day", font=("TkDefaultFont", 10, "bold"), spacing1=6)
+    sku_list.tag_config("picked", background=dark["select"])
+    sku_list.tag_config("code", font=("TkDefaultFont", 9, "bold"), foreground=dark["hit"])
+    sku_list.tag_config("swap", foreground="#e0a060")
+    sku_list.tag_config("quiet", foreground=dark["muted"])
+
+    rank_card = card(board, "Ocorrências por equipamento no período")
+    rank_card.pack(fill="both", expand=True, pady=(10, 0))
+    rank_chart = tk.Canvas(rank_card, height=150, background=dark["card"], highlightthickness=0)
+    rank_chart.pack(fill="both", expand=True)
 
     status_line = ttk.Label(root, textvariable=status, padding=(12, 4), foreground="#555")
     status_line.pack(fill="x")
@@ -1633,48 +1680,35 @@ def main(path=None):
             or "Com palavra-chave, só a frase que a contém aparece. Enter refiltra.")
 
     def draw_board(result):
-        """Second tab: the same filter, seen as production numbers."""
+        """Produção tab: the same filter, seen as production numbers."""
         numbers = production_summary(book["headers"], result["matched"])
         book["board"] = numbers
+        book["columns"], book["monthly"] = chart_columns(numbers)
+        book["picked"] = None
         about = ", ".join(terms())
-        dias = len(numbers["dias"])
-        quando = ("Produzido por hora em " + show(numbers["dias"][0][0]) if dias == 1
-                  else "Produzido por hora" if len(numbers["slots"]) <= 120
-                  else "Produzido por dia" if dias <= 31 else "Produzido por mês")
-        board_title.set(quando + ("   ·   clique numa barra para abrir os dias"
-                                  if dias > 1 else "")
-                        + (f" — só horas com {about}" if about else "")
-                        + "   (linha azul: planejado · verde bateu o plano · vermelho ficou abaixo)")
+        chart_title.set("Tempo de troca (changeover) e produção por {}   ·   troca total {:.0f} min{}"
+                        .format("mês" if book["monthly"] else "dia",
+                                sum(v for _, v in numbers["trocas_por_dia"]),
+                                f"   ·   só horas com {about}" if about else ""))
         sku_title.set(f"SKU e changeover por dia — {about}" if about
                       else "SKU e changeover por dia")
         tile_values["plan"].configure(text=thousands(numbers["plan"]))
         tile_values["produzido"].configure(text=thousands(numbers["produzido"]))
-        tile_values["faltou"].configure(text=thousands(numbers["faltou"]))
+        tile_values["faltou"].configure(text=thousands(numbers["faltou"]),
+                                        foreground=dark["miss"] if numbers["faltou"] > 0
+                                        else dark["text"])
         tile_values["atingido"].configure(
             text="—" if numbers["atingido"] is None else f"{numbers['atingido'] * 100:.1f}%")
-        tile_values["ocorrencias"].configure(text=str(sum(n for _, n in numbers["equipamentos"])))
-        # one day -> per hour; a short period -> per hour across the days; longer -> per day
-        if len(numbers["dias"]) == 1:
-            book["series"] = numbers["horas"]
-        elif len(numbers["slots"]) <= 120:
-            book["series"] = numbers["slots"]
-        elif len(numbers["dias"]) <= 31:
-            book["series"] = numbers["dias"]
-        else:  # more than a month of bars is a picket fence: one bar per month
-            book["series"] = numbers["meses"]
-        book["monthly"] = book["series"] is numbers["meses"]
-        draw_day_chart(day_chart, book["series"])
-        por_mes = len(numbers["dias"]) > 31
-        book["swaps"] = (_monthly(numbers["trocas_por_dia"]) if por_mes
-                         else numbers["trocas_por_dia"])
-        swap_title.set("Tempo de troca (changeover) por {} · total {:.0f} min".format(
-            "mês" if por_mes else "dia", sum(v for _, v in numbers["trocas_por_dia"])))
-        draw_time_chart(swap_chart, book["swaps"])
-        draw_rank_chart(rank_chart, numbers["equipamentos"], highlight=book.get("over"))
+        tile_values["ocorrencias"].configure(
+            text=thousands(sum(n for _, n in numbers["equipamentos"])))
+        redraw_board()
         sku_list.configure(state="normal")
         sku_list.delete("1.0", "end")
         for day in numbers["skus_por_dia"]:
             skus, swaps = day["skus"], day["swaps"]
+            # a mark per day, so a click on the chart can bring that day into view
+            sku_list.mark_set(f"day{day['day']:%Y%m%d}", "end-1c")
+            sku_list.mark_gravity(f"day{day['day']:%Y%m%d}", "left")
             head = show(day["day"]) + (f"   ·   {day['file']}" if day["file"] else "")
             sku_list.insert("end", head + "\n", "day")
             if not skus:
@@ -1700,34 +1734,42 @@ def main(path=None):
             sku_list.insert("end", "Nenhum SKU no filtro.", "quiet")
         sku_list.configure(state="disabled")
 
-    def _monthly(series):
-        months = {}
-        for day, value in series:
-            first = day.replace(day=1)
-            months[first] = months.get(first, 0) + value
-        return [(month, months[month]) for month in sorted(months)]
+    def redraw_board(*_):
+        if book.get("board"):
+            draw_combo_chart(day_chart, book["columns"], book["monthly"], book.get("picked"))
+            draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=book.get("over"),
+                            colour=dark["miss"], strong="#e88a4a", ink=dark["text"],
+                            quiet=dark["muted"])
 
-    def swap_hover(event):
-        series = book.get("swaps") or []
-        slot = tag_index(swap_chart, event.x, event.y, "slot")
-        if slot is None or slot >= len(series):
-            swap_chart.delete("tip")
+    def slot_under(event):
+        slot = tag_index(day_chart, event.x, event.y, "slot")
+        return slot if slot is not None and slot < len(book.get("columns") or []) else None
+
+    def pick_day(event):
+        """Click a day: highlight it and bring its SKU and changeovers into view."""
+        slot = slot_under(event)
+        if slot is None:
             return
-        label, minutes = series[slot]
-        draw_tip(swap_chart, event.x, event.y,
-                 [show(label), f"Troca: {minutes:.0f} min"])
+        book["picked"] = slot
+        redraw_board()
+        when = book["columns"][slot][0]
+        days = [d["day"] for d in book["board"]["skus_por_dia"]
+                if (d["day"].replace(day=1) if book["monthly"] else d["day"]) == when]
+        sku_list.tag_remove("picked", "1.0", "end")
+        if days:
+            mark = f"day{days[0]:%Y%m%d}"
+            sku_list.tag_add("picked", mark, f"{mark} lineend+1c")
+            sku_list.yview(mark)
+        say("{} selecionado. Duplo clique filtra só ele.".format(
+            when.strftime("%m/%Y") if book["monthly"] else show(when)))
 
     def zoom_in(event):
-        """Click a bar to open the level below: month -> its days, day -> its hours."""
-        series = book.get("series") or []
-        slot = tag_index(day_chart, event.x, event.y, "slot")
-        if slot is None or slot >= len(series):
+        """Double-click a day (or month) to filter the whole screen down to it."""
+        slot = slot_under(event)
+        if slot is None:
             return
-        label = series[slot][0]
-        day = label[0] if isinstance(label, tuple) else label
-        if not hasattr(day, "day"):
-            return  # already at hour level: nothing finer to open
-        if book.get("monthly"):
+        day = book["columns"][slot][0]
+        if book["monthly"]:
             first = day.replace(day=1)
             last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
         else:
@@ -1736,32 +1778,21 @@ def main(path=None):
         end_date.set(show(last))
         refresh()
         say("Abrindo {}. Apague as datas para voltar ao período inteiro.".format(
-            first.strftime("%m/%Y") if book.get("monthly") else show(first)))
-
-    def redraw_board(*_):
-        if book.get("board"):
-            draw_day_chart(day_chart, book.get("series") or book["board"]["dias"])
-            draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=book.get("over"))
-            draw_time_chart(swap_chart, book.get("swaps") or [])
-
-    def slot_under(event):
-        return tag_index(day_chart, event.x, event.y, "slot")
+            first.strftime("%m/%Y") if book["monthly"] else show(first)))
 
     def day_hover(event):
-        series = book.get("series") or []
         slot = slot_under(event)
-        if slot is None or slot >= len(series):
+        if slot is None:
             day_chart.delete("tip")
             return
-        label, planned, produced = series[slot]
-        title = (f"{show(label[0])} · {label[1]}" if isinstance(label, tuple)
-                 else show(label) if hasattr(label, "day") else str(label))
-        lines = [title, f"Produzido: {thousands(produced)}"]
+        when, minutes, planned, produced = book["columns"][slot]
+        lines = [when.strftime("%m/%Y") if book["monthly"] else show(when),
+                 f"Changeover: {minutes:.0f} min", f"Produzido: {thousands(produced)}"]
         if planned is None:
-            lines.append("Planejado: não anotado")
+            lines.append("Plano: não anotado")
         else:
             gap = produced - planned
-            lines += [f"Planejado: {thousands(planned)}",
+            lines += [f"Plano: {thousands(planned)}",
                       "{}{} ({:.0f}%)".format("+" if gap >= 0 else "", thousands(gap),
                                               produced / planned * 100 if planned else 0)]
         draw_tip(day_chart, event.x, event.y, lines)
@@ -1776,7 +1807,7 @@ def main(path=None):
             return
         book["over"] = over
         rank_chart.configure(cursor="hand2" if over is not None else "")
-        draw_rank_chart(rank_chart, book["board"]["equipamentos"], highlight=over)
+        redraw_board()
         if over is not None:
             name = book["board"]["equipamentos"][over][0]
             say(f"Clique em {name} para ver só o que envolve esse equipamento.")
@@ -1815,12 +1846,10 @@ def main(path=None):
     show_history()
     day_chart.bind("<Configure>", redraw_board)
     day_chart.bind("<Motion>", day_hover)
-    day_chart.bind("<Button-1>", zoom_in)
+    day_chart.bind("<Button-1>", pick_day)
+    day_chart.bind("<Double-Button-1>", zoom_in)
     day_chart.bind("<Leave>", lambda _: day_chart.delete("tip"))
     rank_chart.bind("<Configure>", redraw_board)
-    swap_chart.bind("<Configure>", redraw_board)
-    swap_chart.bind("<Motion>", swap_hover)
-    swap_chart.bind("<Leave>", lambda _: swap_chart.delete("tip"))
     rank_chart.bind("<Motion>", rank_hover)
     rank_chart.bind("<Leave>", lambda _: (book.update(over=None), redraw_board()))
     rank_chart.bind("<Button-1>", rank_click)

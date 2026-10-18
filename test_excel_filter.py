@@ -469,24 +469,54 @@ class Charts(unittest.TestCase):
         if hasattr(self, "root"):
             self.root.destroy()
 
-    def test_day_chart_draws_one_bar_per_day_with_its_planned_line(self):
-        days = [(date(2023, 11, 1), 1000, 800), (date(2023, 11, 2), 1000, 900)]
-        excel_filter.draw_day_chart(self.canvas, days)
-        blue = [i for i in self.canvas.find_all()
-                if self.canvas.type(i) == "line" and self.canvas.itemcget(i, "fill") == "#1565c0"]
-        self.assertEqual((len(self.painted()), len(blue)), (2, 2))
+    def made(self):
+        """The production bars of the combo chart, in drawing order."""
+        c = excel_filter.BOARD_COLOURS
+        return [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "rectangle"
+                and self.canvas.itemcget(i, "fill") in (c["hit"], c["miss"], c["unknown"])]
 
-    def test_the_bar_is_green_when_it_reaches_the_plan_and_red_when_it_does_not(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 800),
-                                                  (date(2023, 11, 2), 1000, 1200)])
-        self.assertEqual([self.canvas.itemcget(i, "fill") for i in self.painted()],
-                         ["#c62828", "#2e7d32"])
+    def plan_ticks(self):
+        return [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "line"]
+
+    def test_combo_chart_draws_one_production_bar_per_day_with_its_plan_tick(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 10, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 900)])
+        self.assertEqual((len(self.made()), len(self.plan_ticks())), (2, 2))
+
+    def test_changeover_is_the_bar_on_top(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 30, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 900)])
+        swap = [i for i in self.canvas.find_withtag("slot") if self.canvas.type(i) == "rectangle"
+                and self.canvas.itemcget(i, "fill") == excel_filter.BOARD_COLOURS["swap"]]
+        self.assertEqual(len(swap), 1)  # o dia sem troca não ganha barra
+        self.assertLess(self.canvas.coords(swap[0])[3], self.canvas.coords(self.made()[0])[1])
+
+    def test_the_bar_is_blue_when_it_reaches_the_plan_and_orange_when_it_does_not(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 0, 1000, 800),
+                                                    (date(2023, 11, 2), 0, 1000, 1200)])
+        c = excel_filter.BOARD_COLOURS
+        self.assertEqual([self.canvas.itemcget(i, "fill") for i in self.made()],
+                         [c["miss"], c["hit"]])
 
     def test_every_slot_is_tagged_so_the_mouse_finds_its_numbers(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 800),
-                                                  (date(2023, 11, 2), 1000, 900)])
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 5, 1000, 800),
+                                                    (date(2023, 11, 2), 5, 1000, 900)])
         self.assertTrue(self.canvas.find_withtag("slot0"))
         self.assertTrue(self.canvas.find_withtag("slot1"))
+
+    def test_the_picked_day_gets_a_highlight_behind_it(self):
+        columns = [(date(2023, 11, d), 5, 1000, 900) for d in (1, 2, 3)]
+        select = excel_filter.BOARD_COLOURS["select"]
+
+        def highlights():
+            return [i for i in self.canvas.find_all() if self.canvas.type(i) == "rectangle"
+                    and self.canvas.itemcget(i, "fill") == select]
+        excel_filter.draw_combo_chart(self.canvas, columns)
+        self.assertEqual(highlights(), [])
+        excel_filter.draw_combo_chart(self.canvas, columns, selected=1)
+        box = self.canvas.coords(highlights()[0])
+        middle = self.canvas.coords(self.made()[1])
+        self.assertTrue(box[0] <= middle[0] and middle[2] <= box[2])
 
     def test_the_tip_shows_the_lines_it_was_given(self):
         excel_filter.draw_tip(self.canvas, 50, 50, ["06h - 07h", "Produzido: 1.700"])
@@ -509,11 +539,9 @@ class Charts(unittest.TestCase):
                    if self.canvas.type(i) == "rectangle")
         self.assertLessEqual(self.canvas.coords(box)[2], efetiva)
 
-    def test_producing_above_the_plan_draws_the_bar_past_the_blue_line(self):
-        excel_filter.draw_day_chart(self.canvas, [(date(2023, 11, 1), 1000, 1200)])
-        bar = self.painted()[0]
-        line = next(i for i in self.canvas.find_all() if self.canvas.type(i) == "line"
-                    and self.canvas.itemcget(i, "fill") == "#1565c0")
+    def test_producing_above_the_plan_draws_the_bar_past_the_plan_tick(self):
+        excel_filter.draw_combo_chart(self.canvas, [(date(2023, 11, 1), 0, 1000, 1200)])
+        bar, line = self.made()[0], self.plan_ticks()[0]
         self.assertLess(self.canvas.coords(bar)[1], self.canvas.coords(line)[1])  # y menor = mais alto
 
     def painted(self):
@@ -542,7 +570,7 @@ class Charts(unittest.TestCase):
 
 
     def test_nothing_to_draw_says_so_instead_of_an_empty_box(self):
-        excel_filter.draw_day_chart(self.canvas, [])
+        excel_filter.draw_combo_chart(self.canvas, [])
         texts = [self.canvas.itemcget(i, "text") for i in self.canvas.find_all()]
         self.assertIn("Sem dados no filtro", texts)
 
@@ -598,20 +626,6 @@ class OneDay(unittest.TestCase):
         self.assertEqual(board["dias"], [(date(2023, 11, 6), 5655, 3600)])
         self.assertEqual(sum(p for _, p, _ in board["horas"]), board["plan"])
 
-    def test_the_chart_takes_hour_labels_as_well_as_dates(self):
-        tk = __import__("tkinter")
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            self.skipTest(f"sem display: {error}")
-        root.withdraw()
-        canvas = tk.Canvas(root, width=400, height=200)
-        excel_filter.draw_day_chart(canvas, production_summary(self.HEADERS, self.ROWS)["horas"])
-        labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
-                  if canvas.type(i) == "text"]
-        self.assertIn("06h", labels)
-        root.destroy()
-
     def test_a_single_bar_does_not_stretch_across_the_chart(self):
         tk = __import__("tkinter")
         try:
@@ -622,10 +636,10 @@ class OneDay(unittest.TestCase):
         canvas = tk.Canvas(root, width=900, height=200)
         canvas.pack()
         root.update()
-        excel_filter.draw_day_chart(canvas, [(date(2023, 11, 6), 1885, 1700)])
-        bar = next(i for i in canvas.find_all() if canvas.type(i) == "rectangle")
+        excel_filter.draw_combo_chart(canvas, [(date(2023, 11, 6), 30, 1885, 1700)])
+        bar = next(i for i in canvas.find_withtag("slot") if canvas.type(i) == "rectangle")
         left, _, right, _ = canvas.coords(bar)
-        self.assertLessEqual(right - left, 54)
+        self.assertLessEqual(right - left, 40)
         root.destroy()
 
 
@@ -645,8 +659,8 @@ class PointerLookup(unittest.TestCase):
         self.root.destroy()
 
     def test_finds_the_slot_of_the_day_under_the_point(self):
-        days = [(date(2023, 11, d), 1000, 800) for d in range(1, 6)]
-        excel_filter.draw_day_chart(self.canvas, days)
+        days = [(date(2023, 11, d), 10, 1000, 800) for d in range(1, 6)]
+        excel_filter.draw_combo_chart(self.canvas, days)
         left = [min(self.canvas.bbox(i)[0] for i in self.canvas.find_withtag(f"slot{i}"))
                 for i in range(5)]
         for i, x in enumerate(left):
@@ -659,7 +673,7 @@ class PointerLookup(unittest.TestCase):
         self.assertEqual(excel_filter.tag_index(self.canvas, 200, middle, "bar"), 1)
 
     def test_an_empty_chart_has_nothing_under_the_point(self):
-        excel_filter.draw_day_chart(self.canvas, [])
+        excel_filter.draw_combo_chart(self.canvas, [])
         self.assertIsNone(excel_filter.tag_index(self.canvas, 50, 50, "slot"))
 
 
@@ -682,20 +696,6 @@ class Slots(unittest.TestCase):
     def test_the_slots_add_up_to_the_days(self):
         board = production_summary(self.HEADERS, self.ROWS)
         self.assertEqual(sum(p for _, p, _ in board["slots"]), sum(p for _, p, _ in board["dias"]))
-
-    def test_the_day_number_is_drawn_once_per_day_not_once_per_hour(self):
-        tk = __import__("tkinter")
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            self.skipTest(f"sem display: {error}")
-        root.withdraw()
-        canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, production_summary(self.HEADERS, self.ROWS)["slots"])
-        labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
-                  if canvas.type(i) == "text"]
-        self.assertEqual([l for l in labels if l in ("06", "07")], ["06", "07"])
-        root.destroy()
 
 
 class SkuAndChangeover(unittest.TestCase):
@@ -919,8 +919,8 @@ class MonthlySeries(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 1, 1), 100, 90),
-                                             (date(2026, 2, 1), 100, 110)])
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 1, 1), 5, 100, 90),
+                                               (date(2026, 2, 1), 5, 100, 110)], monthly=True)
         labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
                   if canvas.type(i) == "text"]
         self.assertIn("01/26", labels)
@@ -935,8 +935,8 @@ class MonthlySeries(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=600, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 1, 5), 100, 90),
-                                             (date(2026, 1, 6), 100, 110)])
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 1, 5), 5, 100, 90),
+                                               (date(2026, 1, 6), 5, 100, 110)])
         labels = [canvas.itemcget(i, "text") for i in canvas.find_all()
                   if canvas.type(i) == "text"]
         self.assertIn("05", labels)
@@ -1093,13 +1093,13 @@ class UnknownPlan(unittest.TestCase):
             self.skipTest(f"sem display: {error}")
         root.withdraw()
         canvas = tk.Canvas(root, width=400, height=200)
-        excel_filter.draw_day_chart(canvas, [(date(2026, 2, 3), None, 1500)])
-        painted = [canvas.itemcget(i, "fill") for i in canvas.find_all()
+        excel_filter.draw_combo_chart(canvas, [(date(2026, 2, 3), 0, None, 1500)])
+        painted = [canvas.itemcget(i, "fill") for i in canvas.find_withtag("slot")
                    if canvas.type(i) == "rectangle" and canvas.itemcget(i, "fill")]
-        self.assertEqual(painted, ["#9aa7bd"])  # cinza: sem plano não há "bateu"
-        blue = [i for i in canvas.find_all() if canvas.type(i) == "line"
-                and canvas.itemcget(i, "fill") == "#1565c0"]
-        self.assertEqual(blue, [])  # e sem linha azul, porque não há alvo
+        # cinza-ardósia: sem plano não há "bateu"
+        self.assertEqual(painted, [excel_filter.BOARD_COLOURS["unknown"]])
+        ticks = [i for i in canvas.find_withtag("slot") if canvas.type(i) == "line"]
+        self.assertEqual(ticks, [])  # e sem marca de plano, porque não há alvo
         root.destroy()
 
     def test_the_format_of_the_hour_is_carried_as_data(self):
@@ -1178,3 +1178,27 @@ class FastReader(unittest.TestCase):
         self.assertEqual(first[headers.index("Período")], "06h - 10h")  # a mescla de 4 horas
         self.assertEqual(first[headers.index("Trocas")], "31m19s")
         self.assertEqual(first[headers.index("Formato")], "Hagrid")
+
+
+class ChartColumns(unittest.TestCase):
+    """Changeover and production share one axis, one column per day or month."""
+
+    def numbers(self, days):
+        return {"dias": [(d, 1000, 900) for d in days], "meses": [],
+                "trocas_por_dia": [(d, 10) for d in days]}
+
+    def test_each_day_carries_its_changeover_and_production(self):
+        days = [date(2026, 1, 5), date(2026, 1, 6)]
+        columns, monthly = excel_filter.chart_columns(self.numbers(days))
+        self.assertFalse(monthly)
+        self.assertEqual(columns, [(date(2026, 1, 5), 10, 1000, 900), (date(2026, 1, 6), 10, 1000, 900)])
+
+    def test_more_than_a_month_goes_monthly_and_adds_the_changeover_up(self):
+        days = [date(2026, 1, d) for d in range(1, 32)] + [date(2026, 2, 1)]
+        numbers = self.numbers(days)
+        numbers["meses"] = [(date(2026, 1, 1), 31000, 27900), (date(2026, 2, 1), 1000, 900)]
+        columns, monthly = excel_filter.chart_columns(numbers)
+        self.assertTrue(monthly)
+        self.assertEqual([(when, minutes) for when, minutes, _, _ in columns],
+                         [(date(2026, 1, 1), 310), (date(2026, 2, 1), 10)])
+
