@@ -30,7 +30,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 02:02"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 02:04"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -796,6 +796,19 @@ def _graph_json(url, token, timeout=30):
     return payload
 
 
+def _open(request, timeout):
+    """urlopen with every failure said in words; None when the server answers 304."""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        if error.code == 304:
+            return None
+        raise ValueError(LOGIN_WALL if error.code in (401, 403)
+                         else f"O link respondeu {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise ValueError(f"Não deu para acessar o link: {error.reason}") from error
+
+
 def _save(request, folder, name=None, timeout=60):
     """Stream a download into `folder`: (local .zip/.xlsx, {"etag", "modified"}), or
     (None, {}) when the server answers 304 — nothing new since the version sent.
@@ -805,24 +818,19 @@ def _save(request, folder, name=None, timeout=60):
     the reader as if it were a spreadsheet.
     """
     partial = Path(folder) / "download.part"
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as answer, open(partial, "wb") as out:
-            head = answer.read(4)
-            if head != b"PK\x03\x04":  # every .zip and .xlsx starts like this; a page does not
-                raise ValueError(LOGIN_WALL)
-            out.write(head)
-            while chunk := answer.read(1 << 20):
-                out.write(chunk)
-            tags = {"etag": answer.headers.get("ETag", ""),
-                    "modified": answer.headers.get("Last-Modified", "")}
-            name = name or answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
-    except urllib.error.HTTPError as error:
-        if error.code == 304:
-            return None, {}
-        raise ValueError(LOGIN_WALL if error.code in (401, 403)
-                         else f"O link respondeu {error.code}.") from error
-    except urllib.error.URLError as error:
-        raise ValueError(f"Não deu para acessar o link: {error.reason}") from error
+    answer = _open(request, timeout)
+    if answer is None:
+        return None, {}
+    with answer, open(partial, "wb") as out:
+        head = answer.read(4)
+        if head != b"PK\x03\x04":  # every .zip and .xlsx starts like this; a page does not
+            raise ValueError(LOGIN_WALL)
+        out.write(head)
+        while chunk := answer.read(1 << 20):
+            out.write(chunk)
+        tags = {"etag": answer.headers.get("ETag", ""),
+                "modified": answer.headers.get("Last-Modified", "")}
+        name = name or answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
     try:
         with zipfile.ZipFile(partial) as package:
             workbook = "xl/workbook.xml" in package.namelist()
@@ -993,6 +1001,48 @@ def _check_link(key, known, folder, timeout):
         path.unlink()
         return "", known, None, "", None, path.name
     return "", version, (lambda p=path: p), "", month_of([path.name]), path.name
+
+
+def _month_text(month):
+    return f"{month[1]:02d}/{month[0]}" if month else "mês pelo conteúdo da planilha"
+
+
+def probe_source(key, token="", timeout=30):
+    """What a key reaches, read only: [lines]. Nothing is downloaded or saved.
+
+    "Testar conexão" answers with this: whether the token and the key open the
+    file or the folder, and which spreadsheets and months are behind it — and
+    the base, the sources and SharePoint stay exactly as they were.
+    """
+    key = key.strip()
+    if not key:
+        raise ValueError("Cole a chave para testar.")
+    graph = graph_key(key).startswith(GRAPH_PATHS)
+    if not key.startswith(("http://", "https://")) and not graph:
+        entries = _check_local(Path(key), {})
+        return [f"Achei {len(entries)} planilha(s):"] + [
+            f"{name} · {_month_text(month)}" for _, _, _, _, month, name in entries]
+    if token.strip():
+        item = _graph_json(graph_item_url(key), token, timeout)
+        names = _graph_names(item)
+        if "folder" not in item:
+            return ["Conectou no arquivo {} · {} · modificado por {} em {}".format(
+                item.get("name"), _month_text(month_of(names)), _who(item) or "?",
+                str(item.get("lastModifiedDateTime") or "?")[:16].replace("T", " "))]
+        files = _graph_files(item, token, names, timeout)
+        return [f"Conectou na pasta {item.get('name')}: {len(files)} planilha(s)"] + [
+            "{} · {} · modificado por {}".format(child_names[-1], _month_text(month_of(child_names)),
+                                                 _who(child) or "?")
+            for child, child_names in files]
+    if graph:
+        raise ValueError("Essa chave é do Graph (drives/...): cole o token para testar.")
+    answer = _open(urllib.request.Request(direct_link(key), headers={"User-Agent": "Mozilla/5.0"}),
+                   timeout)
+    with answer:  # only the first bytes: enough to know it is a file, not a login page
+        if answer.read(4) != b"PK\x03\x04":
+            raise ValueError(LOGIN_WALL)
+        name = answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
+    return [f"O link entrega um .zip/.xlsx: {Path(urllib.parse.unquote(name)).name}"]
 
 
 def load_sources(folder=None):
@@ -2477,8 +2527,10 @@ def main(path=None):
                      values=[str(date.today().year), *MONTH_NAMES]).grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=(4, 0))
         ttk.Entry(add_row, textvariable=key).grid(row=1, column=1, sticky="we", pady=(4, 0))
+        probe_button = ttk.Button(add_row, text="Testar conexão", command=lambda: probe())
+        probe_button.grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
         ttk.Button(add_row, text="Adicionar fonte", style="Accent.TButton",
-                   command=lambda: add()).grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
+                   command=lambda: add()).grid(row=1, column=3, padx=(8, 0), pady=(4, 0))
         add_row.columnconfigure(1, weight=1)
         ttk.Label(live, style="Hint.TLabel", wraplength=930, text="Chave = drives/<id>/items/<id>"
                   " de um arquivo ou de uma pasta (o ano, o mês — o app percorre tudo que tiver"
@@ -2566,6 +2618,41 @@ def main(path=None):
             say("Token salvo: as fontes são conferidas agora e a cada minuto.", dark["ok"])
             sync_now()
             fill()
+
+        def probe():
+            """Read only: what the typed token and key reach. Nothing is saved or downloaded."""
+            typed_key, typed_token = key.get(), token.get()
+            probe_button.state(["disabled"])
+            note.set("Testando a conexão...")
+            news = queue.Queue()
+
+            def work():
+                try:
+                    news.put(("ok", probe_source(typed_key, typed_token)))
+                except Exception as error:
+                    news.put(("erro", error))
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    kind, payload = news.get_nowait()
+                except queue.Empty:
+                    dialog.after(100, poll)
+                    return
+                probe_button.state(["!disabled"])
+                note.set("")
+                if kind == "erro":
+                    messagebox.showerror("Testar conexão", f"Não conectou.\n\n{payload}",
+                                         parent=dialog)
+                    return
+                shown = payload[:16] + ([f"... e mais {len(payload) - 16}"] if len(payload) > 16
+                                        else [])
+                messagebox.showinfo("Testar conexão", "\n".join(shown) + "\n\nNada foi baixado"
+                                    " nem salvo. Para trazer os dados, use Adicionar fonte.",
+                                    parent=dialog)
+
+            dialog.after(100, poll)
 
         def add():
             try:

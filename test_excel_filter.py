@@ -1448,6 +1448,17 @@ class Links(Serving, unittest.TestCase):
         source["version"] = version  # what a build before folders saved
         self.assertIsNone(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[1])
 
+    def test_testing_a_link_reads_only_its_first_bytes(self):
+        body = book_bytes(Workbook())
+        base, _ = self.serve(lambda request: (200, [("Content-Disposition",
+                                                     'attachment; filename="Outubro.xlsx"')], body))
+        self.assertEqual(excel_filter.probe_source(base + "/x"),
+                         ["O link entrega um .zip/.xlsx: Outubro.xlsx"])
+        page, _ = self.serve(lambda request: (200, [], b"<html>Entrar</html>"))
+        with self.assertRaises(ValueError) as said:
+            excel_filter.probe_source(page + "/x")
+        self.assertIn("login", str(said.exception))
+
     def test_a_login_page_is_said_never_read_as_a_spreadsheet(self):
         for status, body in ((200, b"<html>Entrar na sua conta</html>"), (403, b"proibido"),
                              (401, b"")):
@@ -1608,6 +1619,23 @@ class Graph(Serving, unittest.TestCase):
         texts = {v[at] for _, v in back["rows"] if v[line_at] == "D02" and v[at]}
         self.assertTrue(texts and all(t.startswith("Tampadora - x = z") for t in texts))
 
+    def test_testing_the_connection_lists_without_downloading_anything(self):
+        self.october()
+        said = excel_filter.probe_source(
+            "https://graph.microsoft.com/v1.0/drives/D/items/OUT/children", "tok-valido")
+        self.assertEqual(said[0], "Conectou na pasta 10 - Outubro: 3 planilha(s)")
+        self.assertIn("Relatório Linha 2.xlsx · 10/2026 · modificado por Ricardo", said)
+        self.assertEqual(self.downloads(), [])  # read only: no file left SharePoint
+        self.assertFalse(self.folder.exists())  # and nothing was saved
+
+    def test_testing_a_single_file_says_its_month_and_who_changed_it(self):
+        self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"')
+        self.items["L1"]["parentReference"]["path"] = "/drives/D/root:/General/2026/10 - Outubro"
+        said = excel_filter.probe_source("drives/D/items/L1", "tok-valido")
+        self.assertTrue(said[0].startswith("Conectou no arquivo Relatório Linha 1.xlsx · 10/2026"
+                                           " · modificado por Ricardo"))
+        self.assertEqual(self.downloads(), [])
+
     def test_an_expired_token_is_said_as_such(self):
         self.october()
         with self.assertRaises(ValueError) as said:
@@ -1661,6 +1689,16 @@ class LiveSources(unittest.TestCase):
         self.assertEqual(excel_filter.sync_sources(self.folder), [("2026", "")])
         self.assertEqual(sorted(e["key"] for e in excel_filter.base_entries(self.folder)),
                          ["D01|2026-10", "D02|2026-09"])
+
+    def test_testing_a_synced_folder_only_looks(self):
+        month = Path(tempfile.mkdtemp()) / "2026" / "10 - Outubro"
+        month.mkdir(parents=True)
+        shift_book("D01").save(month / "Relatório Linha 1.xlsx")
+        self.assertEqual(excel_filter.probe_source(str(month.parent)),
+                         ["Achei 1 planilha(s):", "Relatório Linha 1.xlsx · 10/2026"])
+        self.assertFalse(self.folder.exists())
+        with self.assertRaises(ValueError):
+            excel_filter.probe_source("drives/D/items/X")  # a Graph key needs the token
 
     def test_one_broken_source_never_stops_the_others(self):
         excel_filter.add_source("perdido", str(self.zip.with_name("nao-existe.zip")), self.folder)

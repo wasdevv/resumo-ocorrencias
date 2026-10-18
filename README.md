@@ -129,9 +129,10 @@ calada. Os valores lidos são os **calculados** — a coluna pode ser fórmula, 
 Quem abre o app só filtra e lê a **base salva**, carregada ao abrir. O botão
 **Unilever** faz o login de admin; logado, ele vira **Deslogar** e aparecem
 Abrir, + Adicionar, histórico e **Adicionar API**: `.zip`, o token do Microsoft
-Graph e as **fontes em tempo real** (mês + chave: link do SharePoint, caminho
-`drives/...` ou arquivo da pasta do OneDrive), conferidas a cada minuto e baixadas
-só quando mudam. A base vive em `~/.resumo-ocorrencias/base/` e sobrevive ao
+Graph e as **fontes em tempo real** (nome + chave: `drives/<id>/items/<id>` de um
+arquivo ou de uma pasta inteira, a URL do Graph, o link do SharePoint ou a pasta do
+OneDrive), conferidas a cada minuto e baixadas só quando mudam. **Testar conexão**
+só lê. O app nunca altera nem apaga nada no SharePoint: todo pedido é GET. A base vive em `~/.resumo-ocorrencias/base/` e sobrevive ao
 fechar o app; a mesma linha no mesmo mês substitui a anterior.
 
 `admin.json` (login + hash PBKDF2, nunca a senha) fica fora do git e entra no

@@ -14,7 +14,7 @@ máquina de quem usa). Código em inglês, tela em português.
 ```bash
 pip install -r requirements.txt
 python excel_filter.py            # abre a tela
-python -m unittest discover -s .  # 152 testes
+python -m unittest discover -s .  # 161 testes
 ```
 
 No Linux o Tkinter vem separado: `sudo apt install python3-tk`. No Windows já vem
@@ -110,10 +110,15 @@ não fica lembrado: cada vez que o app abre, começa como leitor.
 **Adicionar API** tem duas abas:
 
 - **Fontes em tempo real** — **Enviar .zip...** importa uma vez. O **token /
-  código** é o token de acesso do Microsoft Graph. Cada **fonte** é um mês (o
-  nome, ex.: outubro) e uma **chave**: o link do arquivo no SharePoint, um caminho
-  `drives/<id>/items/<id>` do Graph, ou o arquivo numa pasta que o OneDrive
-  sincroniza. Enquanto o app está aberto, ele confere cada fonte **a cada minuto**
+  código** é o token de acesso do Microsoft Graph (o do Graph Explorer serve).
+  Cada **fonte** é um nome (ex.: outubro, 2026, Linha 1) e uma **chave**:
+  `drives/<id>/items/<id>` de um **arquivo ou de uma pasta** — a do ano ou a do
+  mês; o app percorre ANO → MÊS → ARQUIVO, pega só `.xlsx`/`.zip` (ignora o `~$`
+  de trava) e tira o mês dos nomes das pastas ("2026" / "10 - Outubro") —, a URL
+  completa do Graph com ela (`/content` e `/children` também servem), o link do
+  SharePoint, ou o arquivo/pasta que o OneDrive sincroniza. **Testar conexão** só
+  lê: diz se o token e a chave abrem o arquivo ou a pasta e quais planilhas e
+  meses estão lá, sem baixar nem salvar nada. Enquanto o app está aberto, ele confere cada fonte **a cada minuto**
   e só baixa quando o arquivo mudou (o `cTag` do Graph, o ETag do link, ou a data
   e o tamanho do arquivo sincronizado). Mudou — "Ricardo trocou x por z" — a base
   é atualizada e a tela se refaz **mantendo os filtros** de quem está olhando, com
@@ -129,8 +134,11 @@ Tudo fica em `~/.resumo-ocorrencias/base/` (no Windows,
 planilha, já lidos — abrir o app não relê os zips — e `fontes.json` com as fontes
 e o token. Fechar o app não apaga nada; só o admin apaga.
 
-Pelo Graph, o token vai só na consulta da descrição do arquivo; o download usa o
-endereço pré-assinado que o Graph devolve, sem token (como a documentação manda).
+O app **só lê** do SharePoint — todo pedido é GET: descrever o arquivo, listar a
+pasta, baixar. Nada é alterado nem apagado lá; Apagar e Remover fonte mexem só
+na cópia do app. Pelo Graph, o token vai só nos pedidos ao Graph; o download usa
+o endereço pré-assinado que o Graph devolve, sem token (como a documentação
+manda), e a lista de uma pasta só segue a próxima página se ela for no Graph.
 Um token vencido aparece como "O token expirou" na fonte, uma vez, e as outras
 fontes continuam.
 
@@ -266,7 +274,7 @@ campos travados enquanto lê. A janela não congela mais.
 
 ## 8. Testes
 
-152 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
+161 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
 e das versões do modelo, mês de referência e conflitos, células mescladas, filtro
 por palavra/período/turno/linha, junção de pacotes, histórico, totais e
 desconhecidos, tempo de troca, sequência de SKU, gráficos (contando os retângulos
