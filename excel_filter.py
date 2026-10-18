@@ -21,18 +21,15 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "17/10 23:04"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "17/10 23:41"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
-EXCEL_EPOCH = date(1899, 12, 30)
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
 # shift -> (first hour, hour it ends); the third one crosses midnight
 SHIFTS = {1: (6, 14), 2: (14, 22), 3: (22, 6)}
 SHIFT_LABELS = {n: f"{n}º turno ({a:02d}h às {b:02d}h)" for n, (a, b) in SHIFTS.items()}
 NS_MAIN ="{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 NS_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-# elements that sit between </sheetData> and <autoFilter> in the schema
-BEFORE_AUTOFILTER = (b"sheetCalcPr", b"sheetProtection", b"protectedRanges", b"scenarios")
 
 
 def parse_date(value):
@@ -593,7 +590,7 @@ def _column_index(headers, name):
 
 def _matcher(headers, text_col, terms, date_col, start, end, hour_col, shift,
              line_col=None, lines=()):
-    """One sieve, used by the summary and by the export — never two rulesets.
+    """One sieve, every view filters through it — never two rulesets.
 
     `shift` is 1, 2 or 3 (see SHIFTS), read from the hour column of each row.
     """
@@ -720,76 +717,6 @@ def _sheet_path(archive, sheet):
     rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
     target = next(r.get("Target") for r in rels if r.get("Id") == rid)
     return target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
-
-
-def _filter_column(index, operators, match_all):
-    """<filterColumn> with customFilters; colId is 0-based inside the range."""
-    tests = "".join(f'<customFilter operator="{op}" val="{v}"/>' for op, v in operators)
-    return (f'<filterColumn colId="{index}">'
-            f'<customFilters and="{1 if match_all else 0}">{tests}</customFilters>'
-            f"</filterColumn>")
-
-
-def _patch_sheet(xml, ref, hidden, criteria):
-    """Mark rows hidden and replace the sheet's <autoFilter>. Nothing else changes."""
-    def row(match):
-        attrs = re.sub(rb'\s+hidden="[^"]*"', b"", match.group(1))
-        number = int(re.search(rb'\br="(\d+)"', attrs).group(1))
-        if number in hidden:
-            attrs += b' hidden="1"'
-        return b"<row" + attrs + match.group(2) + b">"
-
-    xml = re.sub(rb"<row\b([^>]*?)(/?)>", row, xml)
-    xml = re.sub(rb"<autoFilter\b[^>]*/>|<autoFilter\b.*?</autoFilter>", b"", xml, flags=re.S)
-
-    at = xml.index(b"</sheetData>") + len(b"</sheetData>")
-    for tag in BEFORE_AUTOFILTER:  # autoFilter has a fixed slot in the schema
-        found = re.compile(rb"\A<" + tag + rb"\b[^>]*?(/>|>.*?</" + tag + rb">)", re.S).match(xml, at)
-        if found:
-            at = found.end()
-    return xml[:at] + f'<autoFilter ref="{ref}">{"".join(criteria)}</autoFilter>'.encode() + xml[at:]
-
-
-def export(src, dst, sheet, headers, rows, text_col=None, terms=(), date_col=None, start=None,
-           end=None, hour_col=None, shift=None, line_col=None, lines=()):
-    """Copy of the .xlsx with AutoFilter on top of the sheet and non-matching rows hidden.
-
-    Nothing is deleted: clearing the filter in Excel brings everything back. Only
-    this sheet's XML is rewritten — images, formulas, conditional formatting, the
-    sensitivity label and the rest of the package are copied byte for byte.
-    """
-    if Path(src) == Path(dst):
-        raise ValueError("O destino não pode ser o arquivo de origem.")
-    terms = [t.strip().casefold() for t in terms if t.strip()]
-    matches, ti, di, hi = _matcher(headers, text_col, terms, date_col, start, end, hour_col,
-                                   shift, line_col, lines)
-
-    visible = {r for r, v in rows if matches(r, v)}
-    last = max(r for r, _ in rows)
-    hidden = set(range(2, last + 1)) - visible
-
-    criteria, exact = [], True
-    if terms:
-        if len(terms) <= 2:  # Excel takes at most two criteria per column
-            criteria.append(_filter_column(ti, [("equal", f"*{t}*") for t in terms], match_all=False))
-        else:
-            exact = False
-    if hi is not None:  # a shift is a range of hours Excel cannot express: rows stay hidden
-        exact = False
-    if di is not None:
-        bounds = [("greaterThanOrEqual", (start - EXCEL_EPOCH).days) if start else None,
-                  ("lessThanOrEqual", (end - EXCEL_EPOCH).days) if end else None]
-        criteria.append(_filter_column(di, [b for b in bounds if b], match_all=True))
-    ref = f"A1:{get_column_letter(len(headers))}{last}"
-
-    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
-        target = _sheet_path(zin, sheet)
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == target:
-                data = _patch_sheet(data, ref, hidden, criteria)
-            zout.writestr(item, data)
-    return len(visible), exact
 
 
 def download(dst, headers, rows, line_col, date_col, hour_col, text_col, terms=()):
@@ -1350,10 +1277,6 @@ def main(path=None):
     last.grid(row=4, column=1, sticky="w", padx=(0, 8))
     hour_box.grid(row=4, column=2, sticky="w", padx=(0, 8))
 
-    export_button = ttk.Button(top, text="Exportar Excel filtrado",
-                               command=lambda: export_file(), state="disabled")
-    export_button.grid(row=4, column=5, sticky="e")
-
     ttk.Label(top, text="Linhas (nenhuma = todas)").grid(row=3, column=4, sticky="w", pady=(10, 0))
     line_choice = tk.StringVar()
     line_box = ttk.Combobox(top, textvariable=line_choice, state="disabled", width=18)
@@ -1393,7 +1316,8 @@ def main(path=None):
                        spacing1=8, spacing3=6)
 
     board = ttk.Frame(tabs, padding=(10, 8, 10, 8))
-    tabs.add(board, text="  Produção  ")
+    tabs.insert(0, board, text="  Produção  ")  # the main screen: it opens here
+    tabs.select(board)
     tiles = ttk.Frame(board)
     tiles.pack(fill="x")
     tile_values = {}
@@ -1509,7 +1433,7 @@ def main(path=None):
         source.set(f"Lendo {Path(chosen).name}...")
         say("Lendo em segundo plano — a janela continua respondendo.")
         book["reading"], book["adding"] = True, add
-        for widget in (first, last, words, filter_button, export_button, download_button):
+        for widget in (first, last, words, filter_button, download_button):
             widget.state(["disabled"])
         news = queue.Queue()
 
@@ -1534,7 +1458,7 @@ def main(path=None):
                 root.after(50, poll)
                 return
             book["reading"] = False
-            for widget in (first, last, words, filter_button, export_button, download_button):
+            for widget in (first, last, words, filter_button, download_button):
                 widget.state(["!disabled"])
             if kind == "erro":
                 source.set("Nenhuma planilha aberta")
@@ -1600,7 +1524,7 @@ def main(path=None):
         for field in (start_date, end_date, keyword):
             field.set("")
         hour.set("todos")
-        for widget in (first, last, words, filter_button, export_button, download_button):
+        for widget in (first, last, words, filter_button, download_button):
             widget.state(["!disabled"])
         hour_box.configure(state="readonly" if book["hour"] else "disabled")
         if not add:
@@ -1868,30 +1792,6 @@ def main(path=None):
         tabs.select(frame)
         listing.see("1.0")
         say(f"Ocorrências de {name}. Apague a palavra-chave para ver todas de novo.")
-
-    def export_file():
-        if not book["rows"]:
-            return
-        if book.get("kind") == "turno":
-            say("A exportação só vale para planilha de tabela simples — esta é montada"
-                " a partir das abas por dia.", "#b00020")
-            return
-        origin = Path(book["path"])
-        try:
-            target = filedialog.asksaveasfilename(
-                defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
-                initialfile=origin.stem + "_filtrado.xlsx", initialdir=str(origin.parent))
-            if not target:
-                return
-            say("Gravando — arquivo grande leva cerca de um minuto...")
-            root.update()
-            visible, exact = export(book["path"], target, book["sheet"],
-                                    book["headers"], book["rows"], **filters())
-            warning = "" if exact else (" — turno ou mais de 2 palavras: o filtro do Excel abre"
-                                        " sem esse critério, mas as linhas já vêm ocultas")
-            say(f"{visible} linhas visíveis em {target}{warning}", "#1b7a3d")
-        except Exception as error:
-            say(f"Erro: {error}", "#b00020")
 
     def download_file():
         """Linha, Data, Hora and Ocorrência of what the Ocorrências tab is showing."""
