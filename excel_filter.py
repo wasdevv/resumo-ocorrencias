@@ -30,7 +30,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 02:04"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 02:42"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -1997,6 +1997,12 @@ def main(path=None):
             ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
                 row=2, column=column, columnspan=span, sticky="w", pady=(4, 0))
 
+    # the name of the app first, above everything else
+    ttk.Label(root, text="Oráculo Digital", style="Brand.TLabel",
+              padding=(14, 10, 14, 0)).pack(fill="x")
+    ttk.Label(root, text="enxergando oportunidades", style="Tagline.TLabel",
+              padding=(14, 0, 14, 0)).pack(fill="x")
+
     # file bar: what is open, and — for the admin — how to open or feed something else
     files = panel(root)
     files.pack(fill="x", padx=10, pady=(10, 0))
@@ -2056,11 +2062,7 @@ def main(path=None):
                                  state="disabled")
     download_button.pack(fill="x")
 
-    ttk.Label(root, text="Oráculo Digital", style="Brand.TLabel",
-              padding=(14, 12, 14, 0)).pack(fill="x")
-    ttk.Label(root, text="enxergando oportunidades", style="Tagline.TLabel",
-              padding=(14, 0, 14, 0)).pack(fill="x")
-    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 8, 14, 2))
+    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 10, 14, 2))
     headline.pack(fill="x")
     headline.bind("<Configure>", lambda e: headline.configure(wraplength=e.width - 24))
 
