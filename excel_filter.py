@@ -21,7 +21,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 00:30"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 00:35"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -1049,10 +1049,12 @@ def merge(datasets):
             "sources": sources}
 
 
-# the Produção tab is dark, after the reference panel chosen for it
-BOARD_COLOURS = {"bg": "#111418", "card": "#1a1e24", "grid": "#2a3038", "text": "#e8ebef",
+# the whole app is dark, after the reference panel chosen for the Produção tab
+BOARD_COLOURS = {"bg": "#0b0d10", "card": "#16191e", "grid": "#272c34", "text": "#e8ebef",
                  "muted": "#8b95a3", "hit": "#8ab8f0", "miss": "#c8601a", "plan": "#ffffff",
-                 "swap": "#7d8794", "unknown": "#4a5361", "select": "#22344a"}
+                 "swap": "#7d8794", "unknown": "#4a5361", "select": "#22344a",
+                 "field": "#1f242b", "button": "#242a32", "accent": "#3d7bd9",
+                 "ok": "#5cd08a", "error": "#ff6b6b"}
 
 
 def chart_columns(numbers):
@@ -1237,16 +1239,20 @@ def draw_chips(frame, chosen, on_remove):
     for child in frame.winfo_children():
         child.destroy()
     if not chosen:
-        ttk.Label(frame, text="todas as linhas", foreground="#777").pack(side="left")
+        ttk.Label(frame, text="todas as linhas", foreground=BOARD_COLOURS["muted"],
+                  background=BOARD_COLOURS["card"]).pack(side="left")
         return []
     made = []
     for name in chosen:
-        chip = tk.Frame(frame, background="#dce6f5", padx=6, pady=1)
+        tone = BOARD_COLOURS["select"]
+        chip = tk.Frame(frame, background=tone, padx=8, pady=2)
         chip.pack(side="left", padx=(0, 4))
-        tk.Label(chip, text=name, background="#dce6f5").pack(side="left")
-        close = tk.Button(chip, text="✕", background="#dce6f5", activebackground="#c3d4ee",
+        tk.Label(chip, text=name, background=tone, foreground=BOARD_COLOURS["text"]).pack(side="left")
+        close = tk.Button(chip, text="✕", background=tone, activebackground=BOARD_COLOURS["grid"],
                           relief="flat", borderwidth=0, highlightthickness=0, padx=3, pady=0,
-                          cursor="hand2", foreground="#345", command=lambda n=name: on_remove(n))
+                          cursor="hand2", foreground=BOARD_COLOURS["muted"],
+                          activeforeground=BOARD_COLOURS["text"],
+                          command=lambda n=name: on_remove(n))
         close.pack(side="left")
         made.append(close)
     return made
@@ -1258,16 +1264,56 @@ def main(path=None):
 
     root = tk.Tk()
     root.title(f"Resumo de ocorrências — build {BUILD}")
-    # a readonly combobox paints its whole field with the selection colour once it
-    # has focus: white it out, or every picker looks like a blue block
-    style = ttk.Style()
-    style.map("TCombobox", fieldbackground=[("readonly", "white")],
-              selectbackground=[("readonly", "white")], selectforeground=[("readonly", "black")])
+    dark = BOARD_COLOURS
+    root.configure(background=dark["bg"])
     root.geometry("1280x900")
     try:  # the board needs the room: open maximised where the platform knows how
         root.state("zoomed")
     except tk.TclError:
         pass
+    style = ttk.Style()
+    style.theme_use("clam")  # the native themes ignore most colours; clam takes them all
+    style.configure(".", background=dark["bg"], foreground=dark["text"],
+                    fieldbackground=dark["field"], bordercolor=dark["grid"],
+                    lightcolor=dark["grid"], darkcolor=dark["grid"], troughcolor=dark["bg"],
+                    insertcolor=dark["text"], selectbackground=dark["select"],
+                    selectforeground=dark["text"], arrowcolor=dark["muted"],
+                    font=("TkDefaultFont", 10))
+    style.map(".", foreground=[("disabled", dark["muted"])],
+              fieldbackground=[("disabled", dark["card"])])
+    style.configure("Card.TFrame", background=dark["card"])
+    style.configure("Card.TLabel", background=dark["card"])
+    style.configure("Field.TLabel", background=dark["card"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9, "bold"))
+    style.configure("Hint.TLabel", background=dark["card"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9))
+    style.configure("File.TLabel", background=dark["card"], font=("TkDefaultFont", 12, "bold"))
+    style.configure("Period.TLabel", font=("TkDefaultFont", 12, "bold"))
+    style.configure("TEntry", padding=(8, 6))
+    style.configure("TCombobox", padding=(8, 6))
+    # a readonly combobox paints its whole field with the selection colour once it
+    # has focus: keep it the field colour, or every picker looks like a blue block
+    style.map("TCombobox", fieldbackground=[("readonly", dark["field"]),
+                                            ("disabled", dark["card"])],
+              selectbackground=[("readonly", dark["field"])],
+              selectforeground=[("readonly", dark["text"])])
+    root.option_add("*TCombobox*Listbox.background", dark["field"])
+    root.option_add("*TCombobox*Listbox.foreground", dark["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", dark["select"])
+    root.option_add("*TCombobox*Listbox.selectForeground", dark["text"])
+    style.configure("TButton", background=dark["button"], padding=(14, 7), borderwidth=1)
+    style.map("TButton", background=[("disabled", dark["card"]), ("active", dark["grid"])])
+    style.configure("Accent.TButton", background=dark["accent"], foreground="white",
+                    bordercolor=dark["accent"], font=("TkDefaultFont", 10, "bold"))
+    style.map("Accent.TButton", background=[("disabled", dark["card"]), ("active", "#5b93e6")])
+    style.configure("TNotebook", background=dark["bg"], borderwidth=0, bordercolor=dark["grid"],
+                    tabmargins=(0, 4, 0, 0))
+    style.configure("TNotebook.Tab", background=dark["bg"], foreground=dark["muted"],
+                    padding=(16, 8), borderwidth=0, font=("TkDefaultFont", 10, "bold"))
+    style.map("TNotebook.Tab", background=[("selected", dark["card"])],
+              foreground=[("selected", dark["text"])])
+    style.configure("TScrollbar", background=dark["button"], bordercolor=dark["bg"],
+                    arrowcolor=dark["muted"])
     book = {"path": "", "headers": [], "rows": [], "date": "", "hour": "", "text": "",
             "whole": None, "lines": [], "chosen": []}
 
@@ -1277,80 +1323,95 @@ def main(path=None):
     status = tk.StringVar(value="Abra uma planilha, ou escolha uma do histórico.")
     summary = tk.StringVar(value="—")
 
-    top = ttk.Frame(root, padding=10)
-    top.pack(fill="x")
+    def panel(parent):
+        """A card on the black background: one bordered block per job."""
+        box = tk.Frame(parent, background=dark["card"], padx=14, pady=12,
+                       highlightthickness=1, highlightbackground=dark["grid"])
+        return box
 
-    ttk.Button(top, text="Abrir...", command=lambda: open_file()).grid(row=0, column=0, sticky="w")
-    ttk.Button(top, text="+ Adicionar", command=lambda: open_file(add=True)).grid(
-        row=0, column=5, sticky="e")
-    ttk.Label(top, textvariable=source, font=("TkDefaultFont", 10, "bold")).grid(
-        row=0, column=1, columnspan=5, sticky="w", padx=8)
+    def field(parent, caption, widget, column, span=1, hint=None):
+        """Caption above the control, the way a form is read: label, then input."""
+        ttk.Label(parent, text=caption.upper(), style="Field.TLabel").grid(
+            row=0, column=column, columnspan=span, sticky="w", pady=(0, 4))
+        widget.grid(row=1, column=column, columnspan=span, sticky="we", padx=(0, 12))
+        if hint:
+            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+                row=2, column=column, columnspan=span, sticky="w", pady=(4, 0))
 
-    ttk.Label(top, text="Histórico").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    recent_box = ttk.Combobox(top, textvariable=recent, state="readonly", width=70)
-    recent_box.grid(row=1, column=1, columnspan=4, sticky="we", pady=(8, 0), padx=(0, 8))
-    reopen_bar = ttk.Frame(top)
-    reopen_bar.grid(row=1, column=5, pady=(8, 0), sticky="e")
-    ttk.Button(reopen_bar, text="Reabrir", command=lambda: reopen()).pack(side="left")
+    # file bar: what is open, and how to open something else
+    files = panel(root)
+    files.pack(fill="x", padx=10, pady=(10, 0))
+    ttk.Button(files, text="Abrir...", style="Accent.TButton",
+               command=lambda: open_file()).grid(row=0, column=0, rowspan=2, sticky="w")
+    ttk.Button(files, text="+ Adicionar", command=lambda: open_file(add=True)).grid(
+        row=0, column=1, rowspan=2, sticky="w", padx=(8, 16))
+    ttk.Label(files, textvariable=source, style="File.TLabel").grid(row=0, column=2, sticky="w")
+    # what the app worked out on its own: without this the filters look like magic
+    ttk.Label(files, textvariable=detected, style="Hint.TLabel").grid(
+        row=1, column=2, columnspan=2, sticky="w")
+    files.columnconfigure(2, weight=1)
+    reopen_bar = ttk.Frame(files, style="Card.TFrame")
+    reopen_bar.grid(row=0, column=3, sticky="e", pady=(0, 4))
+    ttk.Label(reopen_bar, text="HISTÓRICO", style="Field.TLabel").pack(side="left", padx=(0, 8))
+    recent_box = ttk.Combobox(reopen_bar, textvariable=recent, state="readonly", width=30)
+    recent_box.pack(side="left")
+    ttk.Button(reopen_bar, text="Reabrir", command=lambda: reopen()).pack(side="left", padx=(8, 0))
     ttk.Button(reopen_bar, text="✕", width=3, command=lambda: drop_history()).pack(side="left",
                                                                                   padx=(4, 0))
 
-    # what the app worked out on its own: without this the filters look like magic
-    ttk.Label(top, textvariable=detected, foreground="#3a6ea5").grid(
-        row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
-
-    ttk.Label(top, text="Data inicial (dd/mm/aaaa)").grid(row=3, column=0, sticky="w", pady=(10, 0))
-    ttk.Label(top, text="Data final").grid(row=3, column=1, sticky="w", pady=(10, 0))
-    ttk.Label(top, text="Turno").grid(row=3, column=2, sticky="w", pady=(10, 0))
-
-    first = ttk.Entry(top, textvariable=start_date, width=16, state="disabled")
-    last = ttk.Entry(top, textvariable=end_date, width=16, state="disabled")
-    hour_box = ttk.Combobox(top, textvariable=hour, width=22, state="disabled",
+    # filters: one row of fields, the keyword under them, the actions on the right
+    filters_box = panel(root)
+    filters_box.pack(fill="x", padx=10, pady=(10, 0))
+    fields = ttk.Frame(filters_box, style="Card.TFrame")
+    fields.pack(side="left", fill="x", expand=True)
+    first = ttk.Entry(fields, textvariable=start_date, width=14, state="disabled")
+    last = ttk.Entry(fields, textvariable=end_date, width=14, state="disabled")
+    hour_box = ttk.Combobox(fields, textvariable=hour, width=24, state="disabled",
                             values=["todos"] + list(SHIFT_LABELS.values()))
-
-    first.grid(row=4, column=0, sticky="w", padx=(0, 8))
-    last.grid(row=4, column=1, sticky="w", padx=(0, 8))
-    hour_box.grid(row=4, column=2, sticky="w", padx=(0, 8))
-
-    ttk.Label(top, text="Linhas (nenhuma = todas)").grid(row=3, column=4, sticky="w", pady=(10, 0))
     line_choice = tk.StringVar()
-    line_box = ttk.Combobox(top, textvariable=line_choice, state="disabled", width=18)
-    line_box.grid(row=4, column=4, sticky="w", padx=(0, 8))
-    chips = ttk.Frame(top)
-    chips.grid(row=5, column=4, sticky="w", pady=(4, 0))
-
-    ttk.Label(top, text="Palavra-chave").grid(row=5, column=0, sticky="w", pady=(10, 0))
-    words = ttk.Entry(top, textvariable=keyword, state="disabled")
-    words.grid(row=6, column=0, columnspan=5, sticky="we")
-    filter_button = ttk.Button(top, text="Filtrar", command=lambda: refresh(), state="disabled")
-    filter_button.grid(row=6, column=5, padx=(8, 0), sticky="we")
-    download_button = ttk.Button(top, text="Baixar Dados", command=lambda: download_file(),
+    line_box = ttk.Combobox(fields, textvariable=line_choice, state="disabled", width=16)
+    field(fields, "Data inicial", first, 0, hint="dd/mm/aaaa ou só o dia")
+    field(fields, "Data final", last, 1)
+    field(fields, "Turno", hour_box, 2)
+    field(fields, "Linhas", line_box, 3)
+    chips = ttk.Frame(fields, style="Card.TFrame")
+    chips.grid(row=2, column=3, sticky="w", pady=(4, 0))
+    words = ttk.Entry(fields, textvariable=keyword, state="disabled")
+    field(fields, "Palavra-chave", words, 4, hint="separe por vírgula para buscar qualquer uma"
+                                                   " · Enter filtra")
+    fields.columnconfigure(4, weight=1)
+    actions = ttk.Frame(filters_box, style="Card.TFrame")
+    actions.pack(side="right", padx=(4, 0))
+    filter_button = ttk.Button(actions, text="Filtrar", style="Accent.TButton",
+                               command=lambda: refresh(), state="disabled")
+    filter_button.pack(fill="x", pady=(0, 6))
+    download_button = ttk.Button(actions, text="Baixar Dados", command=lambda: download_file(),
                                  state="disabled")
-    download_button.grid(row=7, column=5, padx=(8, 0), pady=(4, 0), sticky="we")
-    top.columnconfigure(4, weight=1)
+    download_button.pack(fill="x")
 
-    headline = ttk.Label(root, textvariable=summary, padding=(12, 6),
-                         font=("TkDefaultFont", 10, "bold"))
+    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 10, 14, 2))
     headline.pack(fill="x")
     headline.bind("<Configure>", lambda e: headline.configure(wraplength=e.width - 24))
 
     tabs = ttk.Notebook(root)
-    tabs.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+    tabs.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
-    frame = ttk.Frame(tabs, padding=(6, 6, 6, 6))
+    frame = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.add(frame, text="  Ocorrências  ")
-    listing = tk.Text(frame, wrap="word", padx=10, pady=8, spacing3=4, state="disabled")
+    listing = tk.Text(frame, wrap="word", padx=16, pady=12, spacing3=4, state="disabled",
+                      background=dark["card"], foreground=dark["text"], relief="flat",
+                      highlightthickness=1, highlightbackground=dark["grid"],
+                      font=("TkDefaultFont", 10), cursor="arrow")
     bar = ttk.Scrollbar(frame, orient="vertical", command=listing.yview)
     listing.configure(yscrollcommand=bar.set)
     listing.pack(side="left", fill="both", expand=True)
     bar.pack(side="right", fill="y")
-    listing.tag_config("when", font=("TkDefaultFont", 10, "bold"), foreground="#1a4d80")
-    listing.tag_config("none", foreground="#777")
-    listing.tag_config("hit", background="#ffe680")
-    listing.tag_config("line", font=("TkDefaultFont", 11, "bold"), foreground="#123",
-                       spacing1=8, spacing3=6)
+    listing.tag_config("when", font=("TkDefaultFont", 10, "bold"), foreground=dark["hit"])
+    listing.tag_config("none", foreground=dark["muted"])
+    listing.tag_config("hit", background="#6b5310", foreground="#fff3c4")
+    listing.tag_config("line", font=("TkDefaultFont", 12, "bold"), foreground=dark["text"],
+                       spacing1=10, spacing3=6)
 
-    dark = BOARD_COLOURS
     board = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.insert(0, board, text="  Produção  ")  # the main screen: it opens here
     tabs.select(board)
@@ -1390,7 +1451,7 @@ def main(path=None):
     chart_title = tk.StringVar(value="Tempo de troca (changeover) e produção por dia")
     chart_card = card(pair, chart_title)
     chart_card.grid(row=0, column=0, sticky="nsew")
-    day_chart = tk.Canvas(chart_card, height=260, background=dark["card"], highlightthickness=0)
+    day_chart = tk.Canvas(chart_card, height=240, background=dark["card"], highlightthickness=0)
     day_chart.pack(fill="both", expand=True)
     tk.Label(chart_card, background=dark["card"], foreground=dark["muted"], anchor="w",
              text="Clique num dia para ver o SKU e as trocas dele ao lado · "
@@ -1415,10 +1476,10 @@ def main(path=None):
     rank_chart = tk.Canvas(rank_card, height=150, background=dark["card"], highlightthickness=0)
     rank_chart.pack(fill="both", expand=True)
 
-    status_line = ttk.Label(root, textvariable=status, padding=(12, 4), foreground="#555")
+    status_line = ttk.Label(root, textvariable=status, padding=(14, 6), foreground=dark["muted"])
     status_line.pack(fill="x")
 
-    def say(message, tone="#555"):
+    def say(message, tone=BOARD_COLOURS["muted"]):
         status.set(message)
         status_line.configure(foreground=tone)
 
@@ -1451,10 +1512,10 @@ def main(path=None):
 
     def open_file(chosen=None, month=None, add=False):
         if book.get("reading"):
-            say("Espere a leitura em andamento terminar.", "#b00020")
+            say("Espere a leitura em andamento terminar.", dark["error"])
             return
         if add and not book["rows"]:
-            say("Abra o primeiro arquivo antes de adicionar outro.", "#b00020")
+            say("Abra o primeiro arquivo antes de adicionar outro.", dark["error"])
             return
         if not chosen:
             opened = Path(book["path"]).parent if book["path"] else start_dir()
@@ -1475,7 +1536,7 @@ def main(path=None):
                 return
             add = somar
         if not Path(chosen).exists():
-            say(f"{chosen} não está mais nesse caminho.", "#b00020")
+            say(f"{chosen} não está mais nesse caminho.", dark["error"])
             return
         source.set(f"Lendo {Path(chosen).name}...")
         say("Lendo em segundo plano — a janela continua respondendo.")
@@ -1509,7 +1570,7 @@ def main(path=None):
                 widget.state(["!disabled"])
             if kind == "erro":
                 source.set("Nenhuma planilha aberta")
-                say(f"Erro ao ler: {payload}", "#b00020")
+                say(f"Erro ao ler: {payload}", dark["error"])
                 return
             finish(payload)
 
@@ -1522,7 +1583,7 @@ def main(path=None):
             try:
                 data = merge([book["data"], data])
             except ValueError as error:
-                say(f"Erro ao juntar: {error}", "#b00020")
+                say(f"Erro ao juntar: {error}", dark["error"])
                 return
         book["just_loaded"] = ("Somado ao que já estava aberto: {} arquivos.".format(
             len(data.get("sources", []))) if add else "Abriu do zero — o que estava aberto"
@@ -1645,7 +1706,7 @@ def main(path=None):
             # production exists in every hour, even the ones with nothing written down
             hours_result = summarize(book["headers"], book["rows"], **chosen)
         except Exception as error:
-            say(f"Erro: {error}", "#b00020")
+            say(f"Erro: {error}", dark["error"])
             return
         columns = result["columns"]
         when = [columns.index(c) for c in (book["date"], book["label"]) if c in columns]
@@ -1839,9 +1900,9 @@ def main(path=None):
             written = download(target, book["headers"], found["matched"], book.get("line", ""),
                                book["date"], book["label"] or book["hour"], book["text"],
                                chosen["terms"])
-            say(f"{written} ocorrências gravadas em {target}", "#1b7a3d")
+            say(f"{written} ocorrências gravadas em {target}", dark["ok"])
         except Exception as error:
-            say(f"Erro: {error}", "#b00020")
+            say(f"Erro: {error}", dark["error"])
 
     show_history()
     day_chart.bind("<Configure>", redraw_board)

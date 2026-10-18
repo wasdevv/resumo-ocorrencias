@@ -51,6 +51,10 @@ escolhido; sem item escolhido, limpa tudo.
 
 ## 3. A tela
 
+O app inteiro é escuro. No topo, a barra do arquivo (Abrir, + Adicionar,
+histórico); embaixo, um painel com os filtros numa linha só — datas, turno,
+linhas, palavra-chave — e Filtrar / Baixar Dados à direita.
+
 O app abre na aba **Produção**; Ocorrências é a segunda. Acima das abas fica só
 o período filtrado ("05/01/2026 a 31/08/2026").
 
@@ -70,7 +74,7 @@ Filtros: **data inicial / data final**, **turno** (1º 06h–14h, 2º 14h–22h,
 
 ### Aba Produção
 
-Os mesmos filtros, vistos como números, em painéis escuros:
+Os mesmos filtros, vistos como números:
 
 - **Tiles**: planejado, produzido, faltou (laranja quando falta), % atingido,
   linhas de ocorrência.
