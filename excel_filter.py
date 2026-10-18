@@ -21,7 +21,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 00:38"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 00:42"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -1289,6 +1289,8 @@ def main(path=None):
                     font=("TkDefaultFont", 9))
     style.configure("File.TLabel", background=dark["card"], font=("TkDefaultFont", 12, "bold"))
     style.configure("Period.TLabel", font=("TkDefaultFont", 12, "bold"))
+    style.configure("Brand.TLabel", font=("TkDefaultFont", 18, "bold"))
+    style.configure("Tagline.TLabel", foreground=dark["muted"], font=("TkDefaultFont", 10))
     style.configure("TEntry", padding=(8, 6))
     style.configure("TCombobox", padding=(8, 6))
     # a readonly combobox paints its whole field with the selection colour once it
@@ -1389,12 +1391,15 @@ def main(path=None):
                                  state="disabled")
     download_button.pack(fill="x")
 
-    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 10, 14, 2))
+    ttk.Label(root, text="Oráculo Digital", style="Brand.TLabel",
+              padding=(14, 12, 14, 0)).pack(fill="x")
+    ttk.Label(root, text="enxergando oportunidades", style="Tagline.TLabel",
+              padding=(14, 0, 14, 0)).pack(fill="x")
+    headline = ttk.Label(root, textvariable=summary, style="Period.TLabel", padding=(14, 8, 14, 2))
     headline.pack(fill="x")
     headline.bind("<Configure>", lambda e: headline.configure(wraplength=e.width - 24))
 
-    tabs = ttk.Notebook(root)
-    tabs.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+    tabs = ttk.Notebook(root)  # packed after the status line, so that line never gets cut
 
     frame = tk.Frame(tabs, background=dark["bg"], padx=10, pady=10)
     tabs.add(frame, text="  Ocorrências  ")
@@ -1446,7 +1451,7 @@ def main(path=None):
     # machines first; under them the changeover chart and the SKU list side by side
     rank_card = card(board, "Ocorrências por equipamento no período")
     rank_card.pack(fill="x", pady=(10, 0))
-    rank_chart = tk.Canvas(rank_card, height=170, background=dark["card"], highlightthickness=0)
+    rank_chart = tk.Canvas(rank_card, height=150, background=dark["card"], highlightthickness=0)
     rank_chart.pack(fill="x")
 
     pair = tk.Frame(board, background=dark["bg"])
@@ -1456,11 +1461,12 @@ def main(path=None):
     chart_title = tk.StringVar(value="Tempo de troca (changeover) e produção por dia")
     chart_card = card(pair, chart_title)
     chart_card.grid(row=0, column=0, sticky="nsew")
-    day_chart = tk.Canvas(chart_card, height=240, background=dark["card"], highlightthickness=0)
-    day_chart.pack(fill="both", expand=True)
+    # the hint is packed first: on a short screen the chart shrinks, the hint stays
     tk.Label(chart_card, background=dark["card"], foreground=dark["muted"], anchor="w",
              text="Clique num dia para ver o SKU e as trocas dele ao lado · "
-                  "duplo clique filtra só esse dia").pack(fill="x", pady=(6, 0))
+                  "duplo clique filtra só esse dia").pack(side="bottom", fill="x", pady=(6, 0))
+    day_chart = tk.Canvas(chart_card, height=240, background=dark["card"], highlightthickness=0)
+    day_chart.pack(fill="both", expand=True)
 
     sku_title = tk.StringVar(value="SKU e changeover por dia")
     sku_card = card(pair, sku_title)
@@ -1477,7 +1483,8 @@ def main(path=None):
     sku_list.tag_config("quiet", foreground=dark["muted"])
 
     status_line = ttk.Label(root, textvariable=status, padding=(14, 6), foreground=dark["muted"])
-    status_line.pack(fill="x")
+    status_line.pack(side="bottom", fill="x")
+    tabs.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
     def say(message, tone=BOARD_COLOURS["muted"]):
         status.set(message)
