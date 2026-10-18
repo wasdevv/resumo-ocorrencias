@@ -1,5 +1,7 @@
 """python3 -m unittest discover -s excel_filter"""
 
+import io
+import json
 import tempfile
 import unittest
 import zipfile
@@ -1202,3 +1204,186 @@ class ChartColumns(unittest.TestCase):
         self.assertEqual([(when, minutes) for when, minutes, _, _ in columns],
                          [(date(2026, 1, 1), 310), (date(2026, 2, 1), 10)])
 
+
+
+class Access(unittest.TestCase):
+    """Who is the admin. Test credentials only: the real ones never enter the repo."""
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "admin.json"
+        excel_filter.make_admin("admin.teste", "Senha-Certa1", self.path)
+
+    def test_the_right_login_and_password_open_the_admin(self):
+        self.assertTrue(excel_filter.is_admin("admin.teste", "Senha-Certa1", self.path))
+        self.assertTrue(excel_filter.is_admin("  Admin.Teste ", "Senha-Certa1", self.path))
+
+    def test_anything_else_stays_a_viewer(self):
+        for user, password in (("admin.teste", "senha-certa1"), ("outra", "Senha-Certa1"),
+                               ("", ""), ("admin.teste", "")):
+            self.assertFalse(excel_filter.is_admin(user, password, self.path), (user, password))
+
+    def test_the_password_itself_is_never_written(self):
+        self.assertNotIn("Senha-Certa1", self.path.read_text())
+
+    def test_no_file_or_a_broken_one_means_no_admin(self):
+        self.assertFalse(excel_filter.is_admin("admin.teste", "Senha-Certa1",
+                                               self.path.with_name("nada.json")))
+        for broken in ("[]", "7", "{}", "não é json", '{"user": "admin.teste", "salt": "zz"}'):
+            self.path.write_text(broken)
+            self.assertFalse(excel_filter.is_admin("admin.teste", "Senha-Certa1", self.path), broken)
+
+
+class SavedBase(unittest.TestCase):
+    """What the admin feeds stays on disk, once per line and month."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp()) / "base"
+
+    def report(self, line, month):
+        book = Workbook()
+        book.remove(book.active)
+        plan = book.create_sheet("Plan.Prod")
+        for i in range(28):
+            plan.cell(1 + i, 2).value = datetime(month[0], month[1], 1 + i)
+        for day in range(1, 6):
+            sheet = book.create_sheet(str(day))
+            sheet.cell(1, 2).value = f"LINHA {line} - 1º TURNO"
+            sheet.cell(26, 2).value = "Horário"
+            sheet.cell(26, 14).value = "Principais Perdas"
+            for h in range(8):
+                sheet.cell(27 + h, 2).value = f"{6 + h:02d}h - {7 + h:02d}h"
+            sheet.cell(27, 14).value = f"Gasser - alarme no dia {day}"
+        return book
+
+    def bundle(self, months, name="pacote.zip", line="D01"):
+        path = Path(tempfile.mkdtemp()) / name
+        with zipfile.ZipFile(path, "w") as package:
+            for month in months:
+                where = Path(tempfile.mkdtemp()) / f"Linha 1 - {month[1]:02d}.xlsx"
+                self.report(line, month).save(where)
+                package.write(where, where.name)
+        return load(path)
+
+    def test_what_goes_in_comes_back_the_same_with_dates_as_dates(self):
+        data = self.bundle([(2026, 1), (2026, 2)])
+        saved, replaced = excel_filter.base_add(data, "pacote.zip", self.folder)
+        self.assertEqual((len(saved), replaced), (2, []))
+        back = excel_filter.base_load(self.folder)
+        self.assertEqual(sorted(map(repr, (v for _, v in back["rows"]))),
+                         sorted(map(repr, (v for _, v in data["rows"]))))
+        day = back["rows"][0][1][back["headers"].index("Data")]
+        self.assertIs(type(day), date)
+        self.assertEqual([when for _, when, _ in back["months"]], [(2026, 1), (2026, 2)])
+
+    def test_sending_the_same_month_again_replaces_it_instead_of_doubling(self):
+        data = self.bundle([(2026, 1), (2026, 2)])
+        excel_filter.base_add(data, "pacote.zip", self.folder)
+        files_before = sorted(p.name for p in self.folder.iterdir())
+        again = self.bundle([(2026, 1), (2026, 2)], name="pacote (1).zip")
+        _, replaced = excel_filter.base_add(again, "pacote (1).zip", self.folder)
+        self.assertEqual(len(replaced), 2)
+        self.assertEqual(len(excel_filter.base_entries(self.folder)), 2)
+        self.assertEqual(len(excel_filter.base_load(self.folder)["rows"]), len(data["rows"]))
+        self.assertEqual(len(list(self.folder.iterdir())), len(files_before))  # old files went away
+
+    def test_a_new_month_or_another_line_adds_to_what_is_there(self):
+        excel_filter.base_add(self.bundle([(2026, 1)]), "d01.zip", self.folder)
+        excel_filter.base_add(self.bundle([(2026, 2)]), "d01.zip", self.folder)
+        excel_filter.base_add(self.bundle([(2026, 1)], line="D02"), "d02.zip", self.folder)
+        keys = sorted(e["key"] for e in excel_filter.base_entries(self.folder))
+        self.assertEqual(keys, ["D01|2026-01", "D01|2026-02", "D02|2026-01"])
+
+    def test_deleting_takes_the_rows_and_the_file_away(self):
+        excel_filter.base_add(self.bundle([(2026, 1), (2026, 2)]), "pacote.zip", self.folder)
+        january = next(e for e in excel_filter.base_entries(self.folder) if e["month"] == [2026, 1])
+        left = excel_filter.base_remove([january["id"]], self.folder)
+        self.assertEqual([e["month"] for e in left], [[2026, 2]])
+        self.assertFalse((self.folder / f"{january['id']}.json").exists())
+        back = excel_filter.base_load(self.folder)
+        self.assertEqual({when for _, when, _ in back["months"]}, {(2026, 2)})
+        excel_filter.base_remove([left[0]["id"]], self.folder)
+        self.assertIsNone(excel_filter.base_load(self.folder))
+
+    def test_an_empty_or_broken_base_is_an_empty_base(self):
+        self.assertIsNone(excel_filter.base_load(self.folder))
+        self.folder.mkdir(parents=True)
+        for broken in ("[]", "7", "não é json"):
+            (self.folder / "indice.json").write_text(broken)
+            self.assertIsNone(excel_filter.base_load(self.folder))
+
+    def test_an_edited_index_cannot_reach_outside_the_folder(self):
+        self.folder.mkdir(parents=True)
+        outside = self.folder.parent / "fora.json"
+        outside.write_text("{}")
+        (self.folder / "indice.json").write_text(json.dumps([{"id": "../fora", "key": "x|?"}]))
+        self.assertEqual(excel_filter.base_entries(self.folder), [])
+        excel_filter.base_remove(["../fora"], self.folder)
+        self.assertTrue(outside.exists())
+
+    def test_a_lost_file_is_reported_not_hidden(self):
+        excel_filter.base_add(self.bundle([(2026, 1), (2026, 2)]), "pacote.zip", self.folder)
+        lost = excel_filter.base_entries(self.folder)[0]
+        (self.folder / f"{lost['id']}.json").unlink()
+        self.assertEqual(excel_filter.base_load(self.folder)["missing"], [lost["file"]])
+
+    def test_only_shift_reports_with_a_read_month_go_in(self):
+        with self.assertRaises(ValueError):
+            excel_filter.base_add({"kind": "tabela", "headers": [], "rows": []}, "x", self.folder)
+        with self.assertRaises(ValueError):
+            excel_filter.base_add({"kind": "turno", "month_guessed": True, "headers": [], "rows": []},
+                                  "x", self.folder)
+
+
+class Links(unittest.TestCase):
+    """Feeding the base from a link: the file, or a clear no."""
+
+    def serve(self, status, body, headers=()):
+        import http.server
+        import threading
+
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/arquivo"
+
+    def test_a_sharepoint_link_asks_for_the_file_itself(self):
+        self.assertEqual(excel_filter.direct_link("https://empresa.sharepoint.com/:u:/s/x/EaB?e=abc"),
+                         "https://empresa.sharepoint.com/:u:/s/x/EaB?e=abc&download=1")
+        self.assertEqual(excel_filter.direct_link("https://exemplo.com/a.zip"),
+                         "https://exemplo.com/a.zip")
+        with self.assertRaises(ValueError):
+            excel_filter.direct_link("D01_Relatorio.zip")
+
+    def test_a_zip_is_saved_under_the_name_the_server_gave(self):
+        body = io.BytesIO()
+        with zipfile.ZipFile(body, "w") as package:
+            package.writestr("pacote/leia.txt", "oi")
+        url = self.serve(200, body.getvalue(),
+                         [("Content-Disposition", 'attachment; filename="D01_Relatorio.zip"')])
+        path = excel_filter.fetch_link(url, tempfile.mkdtemp())
+        self.assertEqual((path.name, path.read_bytes()), ("D01_Relatorio.zip", body.getvalue()))
+
+    def test_a_workbook_comes_back_as_xlsx(self):
+        where = Path(tempfile.mkdtemp()) / "x.xlsx"
+        Workbook().save(where)
+        path = excel_filter.fetch_link(self.serve(200, where.read_bytes()), tempfile.mkdtemp())
+        self.assertEqual(path.suffix, ".xlsx")
+
+    def test_a_login_page_is_said_never_read_as_a_spreadsheet(self):
+        for status, body in ((200, b"<html>Entrar na sua conta</html>"), (403, b"proibido"),
+                             (401, b"")):
+            with self.assertRaises(ValueError) as said:
+                excel_filter.fetch_link(self.serve(status, body), tempfile.mkdtemp())
+            self.assertIn("login", str(said.exception))

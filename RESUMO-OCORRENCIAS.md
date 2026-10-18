@@ -14,7 +14,7 @@ máquina de quem usa). Código em inglês, tela em português.
 ```bash
 pip install -r requirements.txt
 python excel_filter.py            # abre a tela
-python -m unittest discover -s .  # 125 testes
+python -m unittest discover -s .  # 142 testes
 ```
 
 No Linux o Tkinter vem separado: `sudo apt install python3-tk`. No Windows já vem
@@ -23,8 +23,12 @@ com o instalador do python.org.
 Para gerar o `.exe`:
 
 ```bash
-python -m PyInstaller --onefile --windowed --name "Resumo de Ocorrencias" excel_filter.py
+python -m PyInstaller --onefile --windowed --name "Resumo de Ocorrencias" \
+    --add-data "admin.json:." excel_filter.py
 ```
+
+Sem o `admin.json` ao lado do script, o `.exe` sai sem admin: o login responde
+que não há admin configurado.
 
 O título da janela carrega o carimbo do build (`build 15/09 01:18`) — é como se
 sabe qual versão está rodando.
@@ -51,8 +55,8 @@ escolhido; sem item escolhido, limpa tudo.
 
 ## 3. A tela
 
-O app inteiro é escuro. No topo, a barra do arquivo (Abrir, + Adicionar,
-histórico); embaixo, um painel com os filtros numa linha só — datas, turno,
+O app inteiro é escuro. No topo, o botão **Unilever** e, para o admin, Abrir,
++ Adicionar, API e o histórico; embaixo, um painel com os filtros numa linha só — datas, turno,
 linhas, palavra-chave — e Filtrar / Baixar Dados à direita.
 Abaixo dos filtros, o título **Oráculo Digital** com o subtítulo "enxergando
 oportunidades" e, sob eles, o período filtrado.
@@ -94,6 +98,31 @@ Os mesmos filtros, vistos como números:
 
 Passar o mouse num dia mostra changeover, produzido, plano e % exatos. A janela
 abre maximizada.
+
+### Unilever e API (acesso e base salva)
+
+Quem abre o app é **leitor**: vê só os filtros, as abas e o Baixar Dados, com a
+**base salva** já carregada. O botão **Unilever** pede login e senha; com a conta
+de admin aparecem **Abrir**, **+ Adicionar**, o histórico e o botão **API**.
+Clicar em Unilever de novo sai do modo admin. O login não fica lembrado: cada vez
+que o app abre, começa como leitor.
+
+O **API** alimenta a base de duas formas — o **link do SharePoint** (o app pede o
+arquivo com `download=1`) ou **Enviar zip...** — e lista o que ela guarda, uma
+linha por planilha (linha de produção, mês, linhas, origem, quando entrou). Dá
+para marcar várias e **Apagar selecionados**, com confirmação. A mesma linha no
+mesmo mês **substitui** a anterior: reenviar o zip, mesmo salvo como "(1)", não
+dobra nenhum total.
+
+A base fica em `~/.resumo-ocorrencias/base/` (no Windows,
+`C:\Users\<usuário>\.resumo-ocorrencias\base`): um índice e um arquivo por
+planilha, já lidos — abrir o app não relê os zips. Fechar o app não apaga nada;
+só o admin apaga.
+
+A senha nunca é gravada: `admin.json` guarda o login, um sal e o hash PBKDF2. O
+arquivo fica **fora do git** (o repositório é público) e entra no `.exe` na hora
+do build. Para criar ou trocar: `python excel_filter.py --admin <login>` pede a
+senha duas vezes e grava o `admin.json` ao lado do script.
 
 ### Baixar Dados
 
@@ -197,22 +226,29 @@ campos travados enquanto lê. A janela não congela mais.
 ## 7. Limites conhecidos
 
 - Só `.xlsx`; `.xls` e macros de `.xlsm` não passam pelo openpyxl.
-- Mais de 2 palavras-chave: as linhas certas somem, mas o Excel só aceita 2
-  critérios por coluna e o dropdown do arquivo exportado abre sem o critério.
 - `Seladora` e `Seladora de Caixas` contam separado, porque é assim que está
   escrito no relatório. Unificar exigiria um dicionário de apelidos de máquina.
 - O plano é lido como está escrito; o app **não** recalcula a partir da tabela de
   formatos (a aba Planejamento tem três blocos com valores diferentes para o
   mesmo formato e nada diz qual vale quando).
-- O visual é o Tkinter cru, ainda sem o acabamento de cartões/paleta.
+- O login de admin é uma porta na tela, não segurança: quem desempacotar o
+  `.exe` passa por ela, e a base é JSON comum no disco. Proteção de verdade pede
+  um servidor decidindo quem escreve.
+- A base é **deste computador**. Em outro PC o mesmo `.exe` começa com a base
+  vazia.
+- Link do SharePoint que exige login da empresa (SSO) não baixa: o app diz isso
+  e o caminho é baixar o zip no navegador e usar Enviar zip. Ler com o login da
+  empresa exigiria registrar um app no Azure AD (Microsoft Graph).
 
 ---
 
 ## 8. Testes
 
-125 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
+142 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
 e das versões do modelo, mês de referência e conflitos, células mescladas, filtro
-por palavra/período/hora/linha, junção de pacotes, histórico, totais e
+por palavra/período/turno/linha, junção de pacotes, histórico, totais e
 desconhecidos, tempo de troca, sequência de SKU, gráficos (contando os retângulos
-desenhados num Tk de verdade), chips, máscara de data, e a equivalência entre o
-leitor rápido e o lento.
+desenhados num Tk de verdade), chips, máscara de data, a equivalência entre o
+leitor rápido e o lento, o login de admin, a base salva (ida e volta, reenvio sem
+duplicar, apagar, índice adulterado) e o download por link contra um servidor
+HTTP local de verdade.

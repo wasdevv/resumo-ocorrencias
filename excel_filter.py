@@ -7,10 +7,19 @@ import io
 import json
 import queue
 import calendar
+import hashlib
+import hmac
 import posixpath
 import re
+import secrets
+import shutil
+import sys
+import tempfile
 import threading
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
@@ -18,10 +27,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 00:42"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 01:10"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -121,6 +129,9 @@ SHIFT_FIELD_NAMES = {"horario": "horário", "formato": "formato", "plan": "plan"
                      "produzido": "produzido", "apontado": "apontado",
                      "perdas": "principais perdas"}
 SHIFT_HOURS = 8  # each shift block lists eight hours
+# where the screen finds each thing in a dataset built from the day sheets
+SHIFT_COLUMNS = {"date": "Data", "hour": "Horas", "label": "Período", "text": "Principais perdas",
+                 "line": "Linha"}
 
 
 class _Cell:
@@ -495,6 +506,242 @@ def forget_all():
     return []
 
 
+# --- Admin access ----------------------------------------------------------------
+ADMIN_ROUNDS = 200_000
+
+
+def admin_file():
+    """admin.json: bundled into the .exe at build time, next to the script from source.
+
+    Never committed — the repository is public, and even a salted hash of a
+    short password is crackable once it is on display.
+    """
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "admin.json"
+
+
+def make_admin(user, password, path=None):
+    """Write the admin's login with a salted PBKDF2 hash; the password is never stored."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ADMIN_ROUNDS)
+    target = Path(path or admin_file())
+    target.write_text(json.dumps({"user": user.strip(), "salt": salt.hex(), "hash": digest.hex(),
+                                  "rounds": ADMIN_ROUNDS}), encoding="utf-8")
+    return target
+
+
+def is_admin(user, password, path=None):
+    """Whether this login and password are the admin's. No admin file means no admin.
+
+    ponytail: a check inside a desktop .exe keeps the admin buttons away from the
+    floor; it does not stop someone who unpacks the .exe. Real protection is a
+    server deciding who may write the base.
+    """
+    try:
+        saved = json.loads(Path(path or admin_file()).read_text(encoding="utf-8"))
+        salt, expected = bytes.fromhex(saved["salt"]), bytes.fromhex(saved["hash"])
+        rounds, known = int(saved["rounds"]), str(saved["user"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    typed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, rounds)
+    return hmac.compare_digest(typed, expected) and user.strip().casefold() == known.casefold()
+
+
+# --- Saved base: what the admin fed, kept until the admin deletes it --------------
+BASE_DIR = HISTORY_FILE.parent / "base"
+ENTRY_ID = re.compile(r"[0-9a-f]{16}")
+
+
+def _encode(value):
+    """A cell as JSON: dates travel tagged and come back as dates."""
+    if isinstance(value, datetime):
+        return {"$dt": value.isoformat()}
+    if isinstance(value, date):
+        return {"$d": value.isoformat()}
+    return str(value)  # a time or anything exotic keeps its text, never turns into nothing
+
+
+def _decode(obj):
+    if "$dt" in obj:
+        return datetime.fromisoformat(obj["$dt"])
+    if "$d" in obj:
+        return date.fromisoformat(obj["$d"])
+    return obj
+
+
+def _write_json(path, payload):
+    """Write through a temp file, so a crash mid-write never leaves half a file."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, default=_encode, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def base_entries(folder=None):
+    """One entry per saved workbook. A missing or broken index is an empty base.
+
+    Ids are checked before anything uses them as a file name: an edited index
+    must not be able to point outside the folder.
+    """
+    try:
+        saved = json.loads((Path(folder or BASE_DIR) / "indice.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(saved, list):
+        return []
+    return [e for e in saved if isinstance(e, dict) and e.get("key")
+            and ENTRY_ID.fullmatch(str(e.get("id", "")))]
+
+
+def _workbook_key(headers, rows, name):
+    """(key, line, (year, month)) of a workbook, read from its rows: one line in one month.
+
+    The file name is not the identity — a browser saves the same zip again as
+    "(1)", and the same month sent again has to replace the old one, not double
+    every total. Only a workbook whose line was never written falls back to it.
+    """
+    line_at, date_at = _at(headers, "Linha"), _at(headers, "Data")
+    lines = Counter(str(v[line_at]) for _, v in rows
+                    if line_at is not None and v[line_at] not in (None, "", "—"))
+    months = Counter((d.year, d.month) for d in
+                     (parse_date(v[date_at]) for _, v in rows if date_at is not None) if d)
+    line = lines.most_common(1)[0][0] if lines else ""
+    month = months.most_common(1)[0][0] if months else None
+    when = f"{month[0]}-{month[1]:02d}" if month else "?"
+    return f"{line or name}|{when}", line, month
+
+
+def base_add(data, origin, folder=None):
+    """Save every workbook of a loaded dataset into the base. (saved, replaced) file names.
+
+    The same line and month replaces what was there. Only shift reports with a
+    month that was read go in: the base is one table, and a guessed month would
+    file a whole month of production under the wrong date for good.
+    """
+    if data.get("kind") != "turno":
+        raise ValueError("Só relatório de turno entra na base.")
+    if data.get("month_guessed"):
+        raise ValueError("Nenhuma aba diz o mês desta planilha — envie dentro do zip, com o mês"
+                         " no nome do arquivo.")
+    folder = Path(folder or BASE_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    headers, file_at = data["headers"], _at(data["headers"], "Arquivo")
+    parts = {}
+    for number, values in data["rows"]:
+        name = values[file_at] if file_at is not None else origin
+        parts.setdefault(str(name), []).append((number, values))
+    entries, stale, saved, replaced = base_entries(folder), [], [], []
+    for name, rows in parts.items():
+        key, line, month = _workbook_key(headers, rows, name)
+        for old in [e for e in entries if e["key"] == key]:
+            entries.remove(old)
+            stale.append(old["id"])
+            replaced.append(old.get("file", ""))
+        entry = {"id": secrets.token_hex(8), "key": key, "file": name, "line": line,
+                 "month": list(month) if month else None, "rows": len(rows), "origin": origin,
+                 "added": datetime.now().isoformat(timespec="seconds")}
+        _write_json(folder / f"{entry['id']}.json",
+                    {"headers": headers, "rows": [values for _, values in rows]})
+        entries.append(entry)
+        saved.append(name)
+    _write_json(folder / "indice.json", entries)  # the new files exist before the index says so
+    for gone in stale:  # and the old ones go only after the index stopped pointing at them
+        (folder / f"{gone}.json").unlink(missing_ok=True)
+    return saved, replaced
+
+
+def base_remove(ids, folder=None):
+    """Take workbooks out of the base for good; give back what is left."""
+    folder = Path(folder or BASE_DIR)
+    gone = {i for i in ids if ENTRY_ID.fullmatch(str(i))}
+    kept = [e for e in base_entries(folder) if e["id"] not in gone]
+    if folder.exists():
+        _write_json(folder / "indice.json", kept)
+    for i in gone:
+        (folder / f"{i}.json").unlink(missing_ok=True)
+    return kept
+
+
+def base_load(folder=None):
+    """The saved base as one dataset for the screen, or None when it is empty.
+
+    A workbook whose file is gone or unreadable is listed in "missing", so the
+    screen can say it instead of showing smaller totals as if they were whole.
+    """
+    folder = Path(folder or BASE_DIR)
+    entries = sorted(base_entries(folder),
+                     key=lambda e: (str(e.get("line") or ""), e.get("month") or [0, 0]))
+    headers, rows, months, missing = None, [], [], []
+    for entry in entries:
+        try:
+            saved = json.loads((folder / f"{entry['id']}.json").read_text(encoding="utf-8"),
+                               object_hook=_decode)
+            part_headers, part_rows = saved["headers"], saved["rows"]
+        except (OSError, ValueError, KeyError, TypeError):
+            missing.append(entry.get("file", entry["id"]))
+            continue
+        if headers is None:
+            headers = part_headers
+        elif part_headers != headers:
+            missing.append(entry.get("file", entry["id"]))
+            continue
+        rows.extend((len(rows) + i, values) for i, values in enumerate(part_rows, 1))
+        month = tuple(entry["month"]) if entry.get("month") else None
+        months.append((entry.get("file", ""), month, "base salva"))
+    if not rows:
+        return {"missing": missing} if missing else None
+    read_months = [when for _, when, _ in months if when]
+    return {"kind": "turno", "sheet": "base salva", "headers": headers, "rows": rows,
+            "path": "", "month": min(read_months) if read_months else None, "month_from": None,
+            "month_guessed": False, "months": months, "base": True, "missing": missing,
+            "columns": dict(SHIFT_COLUMNS)}
+
+
+# --- Feeding from a link -------------------------------------------------------------
+LOGIN_WALL = ("O link não devolveu um .zip nem um .xlsx — o SharePoint pediu login. Use um link"
+              " que baixe sem login, ou baixe o zip no navegador e use Enviar zip.")
+
+
+def direct_link(url):
+    """A SharePoint share link answers with a page; download=1 asks for the file itself."""
+    parts = urllib.parse.urlsplit(url.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("O link precisa começar com https://")
+    if parts.hostname.endswith(".sharepoint.com"):
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if not any(name == "download" for name, _ in query):
+            query.append(("download", "1"))
+        parts = parts._replace(query=urllib.parse.urlencode(query))
+    return urllib.parse.urlunsplit(parts)
+
+
+def fetch_link(url, folder, timeout=60):
+    """Download what the link points to into `folder`; the local .zip or .xlsx path.
+
+    Streamed to disk — a month of reports is hundreds of MB. A link that is not
+    public answers with a login page instead of the file: that is said, never
+    handed to the reader as if it were a spreadsheet.
+    """
+    request = urllib.request.Request(direct_link(url), headers={"User-Agent": "Mozilla/5.0"})
+    partial = Path(folder) / "download.part"
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer, open(partial, "wb") as out:
+            head = answer.read(4)
+            if head != b"PK\x03\x04":  # every .zip and .xlsx starts like this; a page does not
+                raise ValueError(LOGIN_WALL)
+            out.write(head)
+            while chunk := answer.read(1 << 20):
+                out.write(chunk)
+            name = answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
+    except urllib.error.HTTPError as error:
+        raise ValueError(LOGIN_WALL if error.code in (401, 403)
+                         else f"O link respondeu {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise ValueError(f"Não deu para acessar o link: {error.reason}") from error
+    with zipfile.ZipFile(partial) as package:
+        workbook = "xl/workbook.xml" in package.namelist()
+    stem = re.sub(r'[<>:"/\\|?*]', "_", Path(urllib.parse.unquote(name or "")).stem) or "sharepoint"
+    return partial.replace(Path(folder) / (stem + (".xlsx" if workbook else ".zip")))
+
+
 def load(path, month=None, progress=None):
     """Open the file once and give back everything the screen needs.
 
@@ -513,8 +760,7 @@ def load(path, month=None, progress=None):
         return {"kind": "turno", "sheet": f"{len(parts)} planilhas do zip", "headers": headers,
                 "rows": rows, "month": min(read_months) if read_months else None,
                 "month_from": None, "month_guessed": False, "months": months, "path": str(path),
-                "columns": {"date": "Data", "hour": "Horas", "label": "Período",
-                            "text": "Principais perdas", "line": "Linha"}}
+                "columns": dict(SHIFT_COLUMNS)}
     book = load_workbook(path, data_only=True, read_only=True)
     try:
         if is_shift_report(book):
@@ -529,8 +775,7 @@ def load(path, month=None, progress=None):
                     # no sheet named the month and nobody asked for one: it is a guess,
                     # and a guessed date must say so instead of passing for a read value
                     "month_guessed": not month and not found,
-                    "columns": {"date": "Data", "hour": "Horas", "label": "Período",
-                                "text": "Principais perdas", "line": "Linha"}}
+                    "columns": dict(SHIFT_COLUMNS)}
         book.close()  # the plain table reader needs random access, so it opens its own
         book = load_workbook(path, data_only=True)
         sheet, headers, rows = read(path, book=book)
@@ -1303,7 +1548,8 @@ def main(path=None):
     root.option_add("*TCombobox*Listbox.foreground", dark["text"])
     root.option_add("*TCombobox*Listbox.selectBackground", dark["select"])
     root.option_add("*TCombobox*Listbox.selectForeground", dark["text"])
-    style.configure("TButton", background=dark["button"], padding=(14, 7), borderwidth=1)
+    style.configure("TButton", background=dark["button"], padding=(12, 6), borderwidth=1,
+                    width=-8)
     style.map("TButton", background=[("disabled", dark["card"]), ("active", dark["grid"])])
     style.configure("Accent.TButton", background=dark["accent"], foreground="white",
                     bordercolor=dark["accent"], font=("TkDefaultFont", 10, "bold"))
@@ -1316,13 +1562,19 @@ def main(path=None):
               foreground=[("selected", dark["text"])])
     style.configure("TScrollbar", background=dark["button"], bordercolor=dark["bg"],
                     arrowcolor=dark["muted"])
+    style.configure("Treeview", background=dark["field"], fieldbackground=dark["field"],
+                    foreground=dark["text"], rowheight=26, bordercolor=dark["grid"])
+    style.map("Treeview", background=[("selected", dark["select"])],
+              foreground=[("selected", dark["text"])])
+    style.configure("Treeview.Heading", background=dark["button"], foreground=dark["muted"],
+                    font=("TkDefaultFont", 9, "bold"), padding=(6, 4))
     book = {"path": "", "headers": [], "rows": [], "date": "", "hour": "", "text": "",
-            "whole": None, "lines": [], "chosen": []}
+            "whole": None, "lines": [], "chosen": [], "admin": None}
 
     source, detected = tk.StringVar(value="Nenhuma planilha aberta"), tk.StringVar()
     start_date, end_date, hour, keyword = (tk.StringVar() for _ in range(4))
-    recent = tk.StringVar()
-    status = tk.StringVar(value="Abra uma planilha, ou escolha uma do histórico.")
+    recent, who = tk.StringVar(), tk.StringVar()
+    status = tk.StringVar(value="Carregando a base salva...")
     summary = tk.StringVar(value="—")
 
     def panel(parent):
@@ -1340,22 +1592,29 @@ def main(path=None):
             ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
                 row=2, column=column, columnspan=span, sticky="w", pady=(4, 0))
 
-    # file bar: what is open, and how to open something else
+    # file bar: what is open, and — for the admin — how to open or feed something else
     files = panel(root)
     files.pack(fill="x", padx=10, pady=(10, 0))
-    ttk.Button(files, text="Abrir...", style="Accent.TButton",
-               command=lambda: open_file()).grid(row=0, column=0, rowspan=2, sticky="w")
-    ttk.Button(files, text="+ Adicionar", command=lambda: open_file(add=True)).grid(
-        row=0, column=1, rowspan=2, sticky="w", padx=(8, 16))
-    ttk.Label(files, textvariable=source, style="File.TLabel").grid(row=0, column=2, sticky="w")
+    file_side = ttk.Frame(files, style="Card.TFrame")
+    file_side.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 16))
+    file_buttons = ttk.Frame(file_side, style="Card.TFrame")
+    file_buttons.pack(anchor="w")
+    open_button = ttk.Button(file_buttons, text="Abrir...", style="Accent.TButton",
+                             command=lambda: open_file())
+    add_button = ttk.Button(file_buttons, text="+ Adicionar", command=lambda: open_file(add=True))
+    api_button = ttk.Button(file_buttons, text="API", command=lambda: open_api())
+    login_button = ttk.Button(file_buttons, text="Unilever", command=lambda: toggle_login())
+    login_button.pack(side="left")
+    ttk.Label(file_side, textvariable=who, style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
+    ttk.Label(files, textvariable=source, style="File.TLabel").grid(row=0, column=1, sticky="w")
     # what the app worked out on its own: without this the filters look like magic
     ttk.Label(files, textvariable=detected, style="Hint.TLabel").grid(
-        row=1, column=2, columnspan=2, sticky="w")
-    files.columnconfigure(2, weight=1)
+        row=1, column=1, columnspan=2, sticky="w")
+    files.columnconfigure(1, weight=1)
     reopen_bar = ttk.Frame(files, style="Card.TFrame")
-    reopen_bar.grid(row=0, column=3, sticky="e", pady=(0, 4))
+    reopen_bar.grid(row=0, column=2, sticky="e", pady=(0, 4))
     ttk.Label(reopen_bar, text="HISTÓRICO", style="Field.TLabel").pack(side="left", padx=(0, 8))
-    recent_box = ttk.Combobox(reopen_bar, textvariable=recent, state="readonly", width=30)
+    recent_box = ttk.Combobox(reopen_bar, textvariable=recent, state="readonly", width=26)
     recent_box.pack(side="left")
     ttk.Button(reopen_bar, text="Reabrir", command=lambda: reopen()).pack(side="left", padx=(8, 0))
     ttk.Button(reopen_bar, text="✕", width=3, command=lambda: drop_history()).pack(side="left",
@@ -1370,6 +1629,7 @@ def main(path=None):
     last = ttk.Entry(fields, textvariable=end_date, width=14, state="disabled")
     hour_box = ttk.Combobox(fields, textvariable=hour, width=24, state="disabled",
                             values=["todos"] + list(SHIFT_LABELS.values()))
+    hour.set("todos")
     line_choice = tk.StringVar()
     line_box = ttk.Combobox(fields, textvariable=line_choice, state="disabled", width=16)
     field(fields, "Data inicial", first, 0, hint="dd/mm/aaaa ou só o dia")
@@ -1592,9 +1852,11 @@ def main(path=None):
             except ValueError as error:
                 say(f"Erro ao juntar: {error}", dark["error"])
                 return
-        book["just_loaded"] = ("Somado ao que já estava aberto: {} arquivos.".format(
-            len(data.get("sources", []))) if add else "Abriu do zero — o que estava aberto"
-            " foi substituído. Use + Adicionar para somar.")
+        book["just_loaded"] = (
+            "Base salva: o que o admin alimentou pelo botão API." if data.get("base")
+            else "Somado ao que já estava aberto: {} arquivos.".format(len(data.get("sources", [])))
+            if add else "Abriu do zero — o que estava aberto foi substituído. Use + Adicionar"
+            " para somar.")
         book["data"] = data
         book.update(path=data.get("path", chosen), headers=data["headers"],
                     rows=data["rows"], kind=data["kind"])
@@ -1604,7 +1866,8 @@ def main(path=None):
         book["line"] = picked.get("line", "")
         book["month"] = data["month"]
         source.set("{}   ·   {} linhas".format(
-            " + ".join(Path(p).name for p in data["sources"]) if data.get("sources")
+            "Base salva" if data.get("base")
+            else " + ".join(Path(p).name for p in data["sources"]) if data.get("sources")
             else Path(chosen).name, len(data["rows"])))
         if data.get("months"):  # zip: several workbooks, each with its own month
             lidos = [f"{when[1]:02d}/{when[0]}" for _, when, _ in data["months"] if when and all(when)]
@@ -1642,9 +1905,251 @@ def main(path=None):
         for widget in (first, last, words, filter_button, download_button):
             widget.state(["!disabled"])
         hour_box.configure(state="readonly" if book["hour"] else "disabled")
-        if not add:
+        if not add and not data.get("base"):
             show_history(remember(chosen, {"rows": len(data["rows"]), "month": data["month"]}))
         refresh()
+
+    def clear_screen():
+        """Nothing to show: every number back to a dash, no stale chart left up."""
+        book.update(rows=[], headers=[], data=None, board=None, columns=[], path="", lines=[],
+                    chosen=[])
+        for text in (listing, sku_list):
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.configure(state="disabled")
+        for label in tile_values.values():
+            label.configure(text="—", foreground=dark["text"])
+        summary.set("—")
+        detected.set("")
+        draw_combo_chart(day_chart, [])
+        draw_rank_chart(rank_chart, [])
+        for widget in (first, last, words, filter_button, download_button):
+            widget.state(["disabled"])
+        hour_box.configure(state="disabled")
+        line_box.configure(state="disabled")
+        redraw()
+
+    def show_base(announce=None):
+        """Put the saved base on screen — what everyone sees when the app opens."""
+        data = base_load() or {}
+        missing = data.get("missing") or []
+        if not data.get("rows"):
+            clear_screen()
+            source.set("Base vazia")
+            if missing:
+                say("Nada da base abriu: " + ", ".join(missing), dark["error"])
+            else:
+                say("A base está vazia — o admin entra em Unilever e alimenta pelo botão API.")
+            return
+        book["adding"] = False
+        finish(data)
+        if missing:  # smaller totals must not pass for whole ones
+            say("Não abriram da base, e os totais estão sem eles: " + ", ".join(missing),
+                dark["error"])
+        elif announce:
+            say(announce, dark["ok"])
+
+    def centre(dialog, size=None):
+        """Open a dialog over the middle of the window, not wherever the system drops it."""
+        dialog.update_idletasks()
+        width, height = size or (dialog.winfo_reqwidth(), dialog.winfo_reqheight())
+        x = max(root.winfo_rootx() + (root.winfo_width() - width) // 2, 0)
+        y = max(root.winfo_rooty() + (root.winfo_height() - height) // 3, 0)
+        dialog.geometry(f"{width}x{height}+{x}+{y}" if size else f"+{x}+{y}")
+
+    def apply_role():
+        """Viewer: filters and results. Admin: also open files, history and the API."""
+        admin = book.get("admin")
+        for button in (open_button, add_button, api_button):
+            if admin:
+                button.pack(side="left", padx=(0, 8), before=login_button)
+            else:
+                button.pack_forget()
+        if admin:
+            reopen_bar.grid()
+        else:
+            reopen_bar.grid_remove()
+        who.set(f"admin: {admin}" if admin else "")
+
+    def toggle_login():
+        """The Unilever button: log in as admin, or out again."""
+        if book.get("admin"):
+            if messagebox.askyesno("Unilever", f"Sair do modo admin ({book['admin']})?"):
+                book["admin"] = None
+                apply_role()
+                say("Saiu do modo admin.")
+            return
+        dialog = tk.Toplevel(root, background=dark["card"], padx=24, pady=20)
+        dialog.title("Unilever — entrar")
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        user, secret, problem = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        ttk.Label(dialog, text="LOGIN", style="Field.TLabel").pack(anchor="w")
+        user_entry = ttk.Entry(dialog, textvariable=user, width=34)
+        user_entry.pack(fill="x", pady=(4, 12))
+        ttk.Label(dialog, text="SENHA", style="Field.TLabel").pack(anchor="w")
+        secret_entry = ttk.Entry(dialog, textvariable=secret, show="•", width=34)
+        secret_entry.pack(fill="x", pady=(4, 6))
+        ttk.Label(dialog, textvariable=problem, style="Card.TLabel",
+                  foreground=dark["error"]).pack(anchor="w")
+
+        def enter(*_):
+            if not admin_file().exists():
+                problem.set("Este .exe foi gerado sem admin configurado.")
+            elif is_admin(user.get(), secret.get()):
+                book["admin"] = user.get().strip()
+                dialog.destroy()
+                apply_role()
+                say(f"Modo admin ({book['admin']}): o botão API alimenta e apaga a base salva.",
+                    dark["ok"])
+            else:
+                secret.set("")
+                problem.set("Login ou senha não conferem.")
+                secret_entry.focus_set()
+
+        ttk.Button(dialog, text="Entrar", style="Accent.TButton", command=enter).pack(
+            fill="x", pady=(10, 0))
+        dialog.bind("<Return>", enter)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        centre(dialog)
+        user_entry.focus_set()
+        dialog.grab_set()
+
+    def open_api():
+        """Admin only: feed the saved base from a SharePoint link or a zip, or delete from it."""
+        if not book.get("admin"):
+            return
+        if book.get("api") and book["api"].winfo_exists():
+            book["api"].lift()
+            return
+        dialog = book["api"] = tk.Toplevel(root, background=dark["card"], padx=20, pady=16)
+        dialog.title("API — base salva")
+        dialog.transient(root)
+        try:
+            remembered = (BASE_DIR / "link.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            remembered = ""
+        link, note = tk.StringVar(value=remembered), tk.StringVar()
+
+        ttk.Label(dialog, text="LINK DO SHAREPOINT", style="Field.TLabel").pack(anchor="w")
+        feed_row = ttk.Frame(dialog, style="Card.TFrame")
+        feed_row.pack(fill="x", pady=(4, 4))
+        ttk.Entry(feed_row, textvariable=link).pack(side="left", fill="x", expand=True)
+        fetch_button = ttk.Button(feed_row, text="Baixar do link", style="Accent.TButton",
+                                  command=lambda: feed_link())
+        fetch_button.pack(side="left", padx=(8, 0))
+        send_button = ttk.Button(feed_row, text="Enviar zip...", command=lambda: feed_file())
+        send_button.pack(side="left", padx=(8, 0))
+        ttk.Label(dialog, style="Hint.TLabel",
+                  text="A mesma linha no mesmo mês substitui o que estava — reenviar não"
+                       " duplica.").pack(anchor="w", pady=(0, 14))
+
+        ttk.Label(dialog, text="NA BASE", style="Field.TLabel").pack(anchor="w")
+        table = ttk.Treeview(dialog, show="headings", selectmode="extended", height=10,
+                             columns=("linha", "mes", "linhas", "planilha", "origem", "quando"))
+        for key, caption, width in (("linha", "Linha", 70), ("mes", "Mês", 80),
+                                    ("linhas", "Linhas", 70), ("planilha", "Planilha", 280),
+                                    ("origem", "Origem", 220), ("quando", "Adicionado", 140)):
+            table.heading(key, text=caption, anchor="w")
+            table.column(key, width=width, anchor="w", stretch=key in ("planilha", "origem"))
+        table.pack(fill="both", expand=True, pady=(4, 10))
+        bottom = ttk.Frame(dialog, style="Card.TFrame")
+        bottom.pack(fill="x")
+        delete_button = ttk.Button(bottom, text="Apagar selecionados", command=lambda: delete())
+        delete_button.pack(side="left")
+        ttk.Button(bottom, text="Mostrar a base na tela", command=lambda: show_base()).pack(
+            side="left", padx=(8, 0))
+        ttk.Label(bottom, textvariable=note, style="Hint.TLabel").pack(side="left", padx=(12, 0))
+
+        def fill():
+            table.delete(*table.get_children())
+            for entry in sorted(base_entries(), key=lambda e: (str(e.get("line") or ""),
+                                                               e.get("month") or [0, 0])):
+                month = entry.get("month")
+                table.insert("", "end", iid=entry["id"], values=(
+                    entry.get("line") or "—", f"{month[1]:02d}/{month[0]}" if month else "?",
+                    thousands(entry.get("rows", 0)), entry.get("file", ""),
+                    entry.get("origin", ""), str(entry.get("added", "")).replace("T", " ")[:16]))
+            note.set(f"{len(table.get_children())} planilhas na base")
+
+        def feed(get_path, origin_of, url=None):
+            """Read off the UI thread, save into the base, then put the base on screen."""
+            for button in (fetch_button, send_button, delete_button):
+                button.state(["disabled"])
+            note.set("Lendo...")
+            news = queue.Queue()
+
+            def work():
+                folder = tempfile.mkdtemp()
+                try:
+                    path = get_path(folder)
+                    data = load(path, progress=lambda i, n, name: news.put(
+                        ("step", f"Lendo {i}/{n}: {name}")))
+                    news.put(("ok", base_add(data, origin_of(path))))
+                except Exception as error:
+                    news.put(("erro", error))
+                finally:
+                    shutil.rmtree(folder, ignore_errors=True)
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    kind, payload = news.get_nowait()
+                except queue.Empty:
+                    dialog.after(100, poll)
+                    return
+                if kind == "step":
+                    note.set(payload)
+                    dialog.after(50, poll)
+                    return
+                for button in (fetch_button, send_button, delete_button):
+                    button.state(["!disabled"])
+                if kind == "erro":
+                    note.set("")
+                    messagebox.showerror("API", str(payload), parent=dialog)
+                    return
+                if url:  # the link worked: offer it again next time
+                    (BASE_DIR / "link.txt").write_text(url, encoding="utf-8")
+                saved, replaced = payload
+                fill()
+                show_base("{} planilha(s) salvas na base{}.".format(
+                    len(saved), f", {len(replaced)} substituída(s)" if replaced else ""))
+
+            dialog.after(100, poll)
+
+        def feed_link():
+            url = link.get().strip()
+            try:
+                direct_link(url)
+            except ValueError as error:
+                messagebox.showerror("API", str(error), parent=dialog)
+                return
+            feed(lambda folder: fetch_link(url, folder), lambda path: f"link · {path.name}", url)
+
+        def feed_file():
+            chosen = filedialog.askopenfilename(
+                parent=dialog, initialdir=start_dir(),
+                filetypes=[("Pacote ou Excel", "*.zip *.xlsx"), ("Pacote de relatórios", "*.zip")])
+            if chosen:
+                feed(lambda folder: Path(chosen), lambda path: path.name)
+
+        def delete():
+            picked = table.selection()
+            if not picked:
+                note.set("Selecione o que apagar (Ctrl ou Shift marcam vários).")
+                return
+            names = [table.set(i, "planilha") for i in picked]
+            shown = "\n".join(names[:12]) + ("\n..." if len(names) > 12 else "")
+            if not messagebox.askyesno("Apagar da base", "Apagar {} planilha(s) da base para"
+                                       " sempre?\n\n{}".format(len(picked), shown), parent=dialog):
+                return
+            base_remove(picked)
+            fill()
+            show_base(f"{len(picked)} planilha(s) apagadas da base.")
+
+        fill()
+        centre(dialog, (940, 560))
 
     def as_date(text):
         if not text.strip():
@@ -1926,12 +2431,22 @@ def main(path=None):
     root.bind("<Return>", refresh)
     hour_box.bind("<<ComboboxSelected>>", refresh)
     line_box.bind("<<ComboboxSelected>>", add_line)
+    apply_role()  # everyone starts as a viewer; the Unilever button logs the admin in
     if path:
         root.after(50, lambda: open_file(path))
+    else:
+        root.after(50, show_base)
     root.mainloop()
 
 
 if __name__ == "__main__":
-    import sys
+    if sys.argv[1:2] == ["--admin"] and len(sys.argv) == 3:
+        # python excel_filter.py --admin <login>: (re)writes admin.json, asking the password twice
+        import getpass
 
-    main(*sys.argv[1:2])  # optional: path of a spreadsheet to open right away
+        typed = getpass.getpass("Senha do admin: ")
+        if typed != getpass.getpass("De novo: "):
+            sys.exit("As senhas não conferem.")
+        print(f"Gravado em {make_admin(sys.argv[2], typed)}")
+    else:
+        main(*sys.argv[1:2])  # optional: path of a spreadsheet to open right away

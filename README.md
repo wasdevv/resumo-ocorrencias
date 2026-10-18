@@ -124,6 +124,17 @@ Linha com data ilegível interrompe dizendo o número da linha, em vez de sumir
 calada. Os valores lidos são os **calculados** — a coluna pode ser fórmula, como
 é o caso no relatório de turno.
 
+## Acesso e base salva
+
+Quem abre o app só filtra e lê a **base salva**, carregada ao abrir. O botão
+**Unilever** faz o login de admin, que libera Abrir, + Adicionar, histórico e
+**API** — alimentar a base por link do SharePoint ou zip, e apagar planilhas
+dela. A base vive em `~/.resumo-ocorrencias/base/` e sobrevive ao fechar o app;
+a mesma linha no mesmo mês substitui a anterior.
+
+`admin.json` (login + hash PBKDF2, nunca a senha) fica fora do git e entra no
+`.exe` no build: `python excel_filter.py --admin <login>` cria o arquivo.
+
 ## Baixar Dados
 
 Um `.xlsx` novo com quatro colunas — Linha, Data, Hora e Ocorrência — e uma
@@ -137,3 +148,6 @@ O turno é lido da hora em que cada linha **começa**: "13h - 14h" é 1º turno.
 
 - Só `.xlsx`; `.xls` e macros de `.xlsm` não passam pelo openpyxl.
 - Ler o arquivo de 59MB leva ~20s (uma vez só, os filtros depois são instantâneos).
+- O login de admin é uma porta na tela, não segurança: o `.exe` pode ser
+  desempacotado. A base é por computador.
+- Link do SharePoint que pede o login da empresa não baixa; use Enviar zip.
