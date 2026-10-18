@@ -21,7 +21,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 00:35"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 00:38"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -1443,7 +1443,12 @@ def main(path=None):
                                     foreground=dark["text"], font=("TkDefaultFont", 15, "bold"))
         tile_values[key].pack(anchor="w")
 
-    # changeover chart and the SKU/changeover list side by side, machines below
+    # machines first; under them the changeover chart and the SKU list side by side
+    rank_card = card(board, "Ocorrências por equipamento no período")
+    rank_card.pack(fill="x", pady=(10, 0))
+    rank_chart = tk.Canvas(rank_card, height=170, background=dark["card"], highlightthickness=0)
+    rank_chart.pack(fill="x")
+
     pair = tk.Frame(board, background=dark["bg"])
     pair.pack(fill="both", expand=True, pady=(10, 0))
     pair.columnconfigure(0, weight=1)
@@ -1470,11 +1475,6 @@ def main(path=None):
     sku_list.tag_config("code", font=("TkDefaultFont", 9, "bold"), foreground=dark["hit"])
     sku_list.tag_config("swap", foreground="#e0a060")
     sku_list.tag_config("quiet", foreground=dark["muted"])
-
-    rank_card = card(board, "Ocorrências por equipamento no período")
-    rank_card.pack(fill="both", expand=True, pady=(10, 0))
-    rank_chart = tk.Canvas(rank_card, height=150, background=dark["card"], highlightthickness=0)
-    rank_chart.pack(fill="both", expand=True)
 
     status_line = ttk.Label(root, textvariable=status, padding=(14, 6), foreground=dark["muted"])
     status_line.pack(fill="x")

@@ -78,6 +78,9 @@ Os mesmos filtros, vistos como números:
 
 - **Tiles**: planejado, produzido, faltou (laranja quando falta), % atingido,
   linhas de ocorrência.
+- **Ocorrências por equipamento**, logo abaixo dos tiles: cada linha do relato
+  começa com a máquina ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca;
+  **clicar leva para as ocorrências daquele equipamento**, já filtradas.
 - **Tempo de troca (changeover) e produção por dia**, num gráfico só: em cima,
   as barras de minutos de changeover; embaixo, numa faixa, a produção do dia —
   azul bateu o plano, laranja ficou abaixo, ardósia sem plano anotado — com a
@@ -86,9 +89,6 @@ Os mesmos filtros, vistos como números:
 - **SKU e changeover por dia**, lado a lado com o gráfico: o SKU inicial do dia
   e, a cada troca, "houve um changeover 08h - 09h (31m19s) · passa a 64830874".
   Com três trocas, chega ao terceiro SKU.
-- **Ocorrências por equipamento**, embaixo: cada linha do relato começa com a
-  máquina ("Gasser - alarme…") e vira uma contagem. Passar o mouse destaca;
-  **clicar leva para as ocorrências daquele equipamento**, já filtradas.
 
 Passar o mouse num dia mostra changeover, produzido, plano e % exatos. A janela
 abre maximizada.
