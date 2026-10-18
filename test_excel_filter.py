@@ -1336,31 +1336,49 @@ class SavedBase(unittest.TestCase):
                                   "x", self.folder)
 
 
+def shift_book(line, month=None, note="Gasser - alarme no dia {day}"):
+    """A small real shift report; without `month` it has no planning sheet to say one."""
+    book = Workbook()
+    book.remove(book.active)
+    if month:
+        plan = book.create_sheet("Plan.Prod")
+        for i in range(28):
+            plan.cell(1 + i, 2).value = datetime(month[0], month[1], 1 + i)
+    for day in range(1, 6):
+        sheet = book.create_sheet(str(day))
+        sheet.cell(1, 2).value = f"LINHA {line} - 1º TURNO"
+        sheet.cell(26, 2).value = "Horário"
+        sheet.cell(26, 14).value = "Principais Perdas"
+        for h in range(8):
+            sheet.cell(27 + h, 2).value = f"{6 + h:02d}h - {7 + h:02d}h"
+        sheet.cell(27, 14).value = note.format(day=day)
+    return book
+
+
 def shift_zip(path, line, months, note="Gasser - alarme no dia {day}"):
     """A real zip of small shift reports, one per month, the way the bundles come."""
     with zipfile.ZipFile(path, "w") as package:
         for month in months:
-            book = Workbook()
-            book.remove(book.active)
-            plan = book.create_sheet("Plan.Prod")
-            for i in range(28):
-                plan.cell(1 + i, 2).value = datetime(month[0], month[1], 1 + i)
-            for day in range(1, 6):
-                sheet = book.create_sheet(str(day))
-                sheet.cell(1, 2).value = f"LINHA {line} - 1º TURNO"
-                sheet.cell(26, 2).value = "Horário"
-                sheet.cell(26, 14).value = "Principais Perdas"
-                for h in range(8):
-                    sheet.cell(27 + h, 2).value = f"{6 + h:02d}h - {7 + h:02d}h"
-                sheet.cell(27, 14).value = note.format(day=day)
             where = Path(tempfile.mkdtemp()) / f"Linha - {month[1]:02d}.xlsx"
-            book.save(where)
+            shift_book(line, month, note).save(where)
             package.write(where, where.name)
     return Path(path)
 
 
+def book_bytes(book):
+    where = Path(tempfile.mkdtemp()) / "x.xlsx"
+    book.save(where)
+    return where.read_bytes()
+
+
+def only(entries):
+    """(version, downloaded file or None, who) of a source that is a single file."""
+    (fid, version, fetch, who, month, name), = entries
+    return version, (fetch() if fetch else None), who
+
+
 class Serving:
-    """A real HTTP server on 127.0.0.1 answering from a dict the test can change."""
+    """A real HTTP server on 127.0.0.1 answering from a function the test controls."""
 
     def serve(self, routes):
         import http.server
@@ -1412,25 +1430,23 @@ class Links(Serving, unittest.TestCase):
                 package.getvalue()
         base, _ = self.serve(routes)
         source = {"key": base + "/arquivo"}
-        version, path, _ = excel_filter.check_source(source, folder=tempfile.mkdtemp())
+        version, path, _ = only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))
         self.assertEqual((version, path.name), ('etag:"v1"', "D01_Relatorio.zip"))
-        source["version"] = version
-        self.assertIsNone(excel_filter.check_source(source, folder=tempfile.mkdtemp())[1])
+        source["versions"] = {"": version}
+        self.assertIsNone(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[1])
         current["etag"] = '"v2"'
-        self.assertEqual(excel_filter.check_source(source, folder=tempfile.mkdtemp())[0], 'etag:"v2"')
+        self.assertEqual(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[0],
+                         'etag:"v2"')
 
     def test_without_any_version_header_the_content_decides(self):
-        content = {"body": b""}
-        where = Path(tempfile.mkdtemp()) / "x.xlsx"
-        Workbook().save(where)
-        content["body"] = where.read_bytes()
-        base, _ = self.serve(lambda request: (200, [], content["body"]))
+        body = book_bytes(Workbook())
+        base, _ = self.serve(lambda request: (200, [], body))
         source = {"key": base + "/arquivo"}
-        version, path, _ = excel_filter.check_source(source, folder=tempfile.mkdtemp())
+        version, path, _ = only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))
         self.assertEqual(path.suffix, ".xlsx")
         self.assertTrue(version.startswith("sha256:"))
-        source["version"] = version
-        self.assertIsNone(excel_filter.check_source(source, folder=tempfile.mkdtemp())[1])
+        source["version"] = version  # what a build before folders saved
+        self.assertIsNone(only(excel_filter.check_source(source, folder=tempfile.mkdtemp()))[1])
 
     def test_a_login_page_is_said_never_read_as_a_spreadsheet(self):
         for status, body in ((200, b"<html>Entrar na sua conta</html>"), (403, b"proibido"),
@@ -1441,10 +1457,10 @@ class Links(Serving, unittest.TestCase):
             self.assertIn("login", str(said.exception))
 
 
-class Graph(Serving, unittest.TestCase):
-    """Through Microsoft Graph, written from its docs (shares-get, driveitem, get-content)."""
+class KeysAndMonths(unittest.TestCase):
+    """What gets pasted, and what the folder names say."""
 
-    def test_a_sharing_link_becomes_the_id_the_docs_describe(self):
+    def test_a_sharing_link_becomes_the_id_the_graph_docs_describe(self):
         link = "https://onedrive.live.com/redir?resid=1231244193912!12&authKey=1201919!12921!1"
         self.assertEqual(excel_filter.share_id(link), "u!aHR0cHM6Ly9vbmVkcml2ZS5saXZlLmNvbS9yZWRpcj9y"
                          "ZXNpZD0xMjMxMjQ0MTkzOTEyITEyJmF1dGhLZXk9MTIwMTkxOSExMjkyMSEx")
@@ -1454,70 +1470,162 @@ class Graph(Serving, unittest.TestCase):
         import base64
         self.assertEqual(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode(), odd)
 
-    def test_the_key_is_a_link_or_a_drives_path(self):
+    def test_every_form_copilot_and_graph_explorer_hand_out_is_the_same_key(self):
+        bare = "drives/b!AbCdEf123_xy/items/01ABCDEFGHIJ"
+        for pasted in (bare, "/" + bare,
+                       f"https://graph.microsoft.com/v1.0/{bare}",
+                       f"https://graph.microsoft.com/v1.0/{bare}/content",
+                       f"https://graph.microsoft.com/v1.0/{bare}/children",
+                       f"GET https://graph.microsoft.com/v1.0/{bare}/children"):
+            self.assertEqual(excel_filter.graph_key(pasted), bare, pasted)
+            self.assertEqual(excel_filter.graph_item_url(pasted), f"{excel_filter.GRAPH}/{bare}")
         self.assertTrue(excel_filter.graph_item_url("https://empresa.sharepoint.com/:x:/s/a/EaB")
                         .endswith("/driveItem"))
-        self.assertEqual(excel_filter.graph_item_url("/drives/b!abc/items/01XY"),
-                         excel_filter.GRAPH + "/drives/b!abc/items/01XY")
         with self.assertRaises(ValueError):
             excel_filter.graph_item_url("10283139X--X123")
 
-    def graph(self, item, token="tok-valido"):
-        workbook = Path(tempfile.mkdtemp()) / "x.xlsx"
-        Workbook().save(workbook)
+    def test_the_month_comes_from_the_folder_names(self):
+        self.assertEqual(excel_filter.month_of(["General", "2026", "10 - Outubro",
+                                                "Relatório Linha 1.xlsx"]), (2026, 10))
+        self.assertEqual(excel_filter.month_of(["2026", "09 - Setembro", "Linha 2",
+                                                "Relatório.xlsx"]), (2026, 9))
+        self.assertEqual(excel_filter.month_of(["turno 2026-03"]), (2026, 3))
+        self.assertIsNone(excel_filter.month_of(["10 - Outubro"]))  # no year anywhere above
+        self.assertIsNone(excel_filter.month_of(["General", "2026", "Relatório Linha 1.xlsx"]))
+
+
+class Graph(Serving, unittest.TestCase):
+    """Microsoft Graph, played by a local server written from its docs: driveitem,
+    shares-get, driveitem-get-content and driveitem-list-children (pages via nextLink)."""
+
+    def setUp(self):
+        self.files, self.folders, self.items = {}, {}, {}
+        self.download = {}
 
         def routes(request):
-            if request.path.startswith("/download/"):
-                return 200, [], workbook.read_bytes()
-            if request.headers.get("Authorization") != f"Bearer {token}":
+            path = request.path
+            if path.startswith("/download/"):
+                return 200, [], self.download[path.rsplit("/", 1)[1]]
+            if request.headers.get("Authorization") != "Bearer tok-valido":
                 return 401, [("Content-Type", "application/json")], json.dumps(
                     {"error": {"code": "InvalidAuthenticationToken",
                                "message": "Lifetime validation failed, the token is expired."}}).encode()
-            return 200, [("Content-Type", "application/json")], json.dumps(item).encode()
-        base, seen = self.serve(routes)
+            for prefix, table in (("/v1.0/drives/D/items/", self.items),):
+                if path.startswith(prefix):
+                    rest = path[len(prefix):]
+                    item_id, _, tail = rest.partition("/")
+                    if tail.startswith("children") and getattr(self, "escape", None):
+                        return 200, [], json.dumps({"value": [],
+                                                    "@odata.nextLink": self.escape}).encode()
+                    if tail.startswith("children"):
+                        pages = self.folders[item_id]
+                        page = int(tail.split("skiptoken=")[1]) if "skiptoken=" in tail else 0
+                        body = {"value": pages[page]}
+                        if page + 1 < len(pages):
+                            body["@odata.nextLink"] = (f"{self.base}/v1.0/drives/D/items/{item_id}"
+                                                       f"/children?$skiptoken={page + 1}")
+                        return 200, [], json.dumps(body).encode()
+                    return 200, [], json.dumps(table[item_id]).encode()
+            return 404, [], b"{}"
+
+        self.base, self.seen = self.serve(routes)
         old = excel_filter.GRAPH
-        excel_filter.GRAPH = base + "/v1.0"
+        excel_filter.GRAPH = self.base + "/v1.0"
         self.addCleanup(setattr, excel_filter, "GRAPH", old)
-        return base, seen
+        self.folder = Path(tempfile.mkdtemp()) / "base"
 
-    def item(self, base, tag):
-        return {"name": "Outubro.xlsx", "cTag": tag, "eTag": tag + "-e",
-                "lastModifiedBy": {"user": {"displayName": "Ricardo"}},
-                "@microsoft.graph.downloadUrl": base + "/download/outubro"}
+    def file(self, item_id, name, line, tag, with_url=True, note="Gasser - alarme no dia {day}"):
+        """A file item as Graph lists it; its content has no planning sheet."""
+        self.download[item_id] = book_bytes(shift_book(line, None, note))
+        item = {"id": item_id, "name": name, "file": {}, "cTag": tag, "eTag": tag + "-e",
+                "parentReference": {"driveId": "D"},
+                "lastModifiedBy": {"user": {"displayName": "Ricardo"}}}
+        if with_url:
+            item["@microsoft.graph.downloadUrl"] = f"{self.base}/download/{item_id}"
+        self.items[item_id] = dict(item, **{"@microsoft.graph.downloadUrl":
+                                           f"{self.base}/download/{item_id}"})
+        return item
 
-    def test_the_token_goes_to_graph_and_never_to_the_download_address(self):
-        item = {}
-        base, seen = self.graph(item)
-        item.update(self.item(base, '"c:{1},1"'))
-        source = {"key": "https://empresa.sharepoint.com/:x:/s/fabrica/EaBcD"}
-        version, path, who = excel_filter.check_source(source, "tok-valido", tempfile.mkdtemp())
-        self.assertEqual((version, path.name, who), ('graph:"c:{1},1"', "Outubro.xlsx", "Ricardo"))
-        metadata, download = seen
-        self.assertTrue(metadata[0].startswith("/v1.0/shares/u!"))
-        self.assertEqual(metadata[1].get("Authorization"), "Bearer tok-valido")
-        self.assertNotIn("Authorization", download[1])
+    def october(self):
+        """2026 / 10 - Outubro: two pages, a line in a subfolder, a lock file, a .docx."""
+        self.items["OUT"] = {"id": "OUT", "name": "10 - Outubro", "folder": {"childCount": 5},
+                             "parentReference": {"driveId": "D",
+                                                 "path": "/drives/D/root:/General/2026"}}
+        self.items["L2F"] = {"id": "L2F", "name": "Linha 2", "folder": {"childCount": 1},
+                             "parentReference": {"driveId": "D"}}
+        self.folders["OUT"] = [
+            [self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"'),
+             {"id": "LCK", "name": "~$Relatório Linha 1.xlsx", "file": {}, "cTag": "x",
+              "parentReference": {"driveId": "D"}},
+             {"id": "DOC", "name": "Leia-me.docx", "file": {}, "cTag": "x",
+              "parentReference": {"driveId": "D"}},
+             self.items["L2F"]],
+            [self.file("L3", "Relatório Linha 3.xlsx", "D03", '"c:{3},1"', with_url=False)]]
+        self.folders["L2F"] = [[self.file("L2", "Relatório Linha 2.xlsx", "D02", '"c:{2},1"')]]
 
-    def test_an_unchanged_ctag_downloads_nothing(self):
-        item = {}
-        base, seen = self.graph(item)
-        item.update(self.item(base, '"c:{1},1"'))
-        source = {"key": "drives/b!abc/items/01XY", "version": 'graph:"c:{1},1"'}
-        self.assertIsNone(excel_filter.check_source(source, "tok-valido", tempfile.mkdtemp())[1])
-        self.assertEqual([path for path, _ in seen], ["/v1.0/drives/b!abc/items/01XY"])
+    def downloads(self):
+        return [path for path, _ in self.seen if path.startswith("/download/")]
+
+    def test_a_single_file_key_reads_with_the_token_and_downloads_without_it(self):
+        self.file("L1", "Relatório Linha 1.xlsx", "D01", '"c:{1},1"')
+        self.items["L1"]["parentReference"]["path"] = "/drives/D/root:/General/2026/10 - Outubro"
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("Relatório de Turno - Linha 1",
+                                "https://graph.microsoft.com/v1.0/drives/D/items/L1/content",
+                                self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder),
+                         [("Relatório de Turno - Linha 1", "Ricardo")])
+        self.assertEqual([e["key"] for e in excel_filter.base_entries(self.folder)], ["D01|2026-10"])
+        for path, headers in self.seen:
+            self.assertEqual("Authorization" in headers, path.startswith("/v1.0/"), path)
+
+    def test_a_folder_key_walks_every_line_and_takes_the_month_from_the_folders(self):
+        self.october()
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("outubro", "drives/D/items/OUT", self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "Ricardo")])
+        self.assertEqual(sorted(e["key"] for e in excel_filter.base_entries(self.folder)),
+                         ["D01|2026-10", "D02|2026-10", "D03|2026-10"])
+        self.assertEqual(sorted(self.downloads()), ["/download/L1", "/download/L2", "/download/L3"])
+        source = excel_filter.load_sources(self.folder)["sources"][0]
+        self.assertEqual((source["files"], source["problem"]), (3, ""))
+
+    def test_the_next_round_downloads_only_what_changed(self):
+        self.october()
+        excel_filter.set_token("tok-valido", self.folder)
+        excel_filter.add_source("outubro", "drives/D/items/OUT", self.folder)
+        excel_filter.sync_sources(self.folder)
+        before = len(self.downloads())
+        self.assertEqual(excel_filter.sync_sources(self.folder), [])
+        self.assertEqual(len(self.downloads()), before)  # nothing moved, nothing fetched
+        changed = self.file("L2", "Relatório Linha 2.xlsx", "D02", '"c:{2},2"',
+                            note="Tampadora - x = z no dia {day}")
+        self.folders["L2F"] = [[changed]]
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("outubro", "Ricardo")])
+        self.assertEqual(self.downloads()[before:], ["/download/L2"])
+        back = excel_filter.base_load(self.folder)
+        at, line_at = back["headers"].index("Principais perdas"), back["headers"].index("Linha")
+        texts = {v[at] for _, v in back["rows"] if v[line_at] == "D02" and v[at]}
+        self.assertTrue(texts and all(t.startswith("Tampadora - x = z") for t in texts))
 
     def test_an_expired_token_is_said_as_such(self):
-        item = {}
-        base, _ = self.graph(item)
-        item.update(self.item(base, "c1"))
+        self.october()
         with self.assertRaises(ValueError) as said:
-            excel_filter.check_source({"key": "drives/b!abc/items/01XY"}, "tok-vencido",
-                                      tempfile.mkdtemp())
+            excel_filter.check_source({"key": "drives/D/items/OUT"}, "tok-vencido", tempfile.mkdtemp())
         self.assertIn("token expirou", str(said.exception))
 
-    def test_a_drives_key_without_a_token_says_it_needs_one(self):
+    def test_a_graph_key_without_a_token_says_it_needs_one(self):
         with self.assertRaises(ValueError) as said:
-            excel_filter.check_source({"key": "drives/b!abc/items/01XY"}, "", tempfile.mkdtemp())
+            excel_filter.check_source({"key": "drives/D/items/OUT"}, "", tempfile.mkdtemp())
         self.assertIn("token", str(said.exception))
+
+    def test_the_token_never_follows_a_next_page_outside_graph(self):
+        self.items["ESC"] = {"id": "ESC", "name": "2026", "folder": {},
+                             "parentReference": {"driveId": "D"}}
+        self.escape = "http://127.0.0.2:9/roubar"  # a page that sends the walk elsewhere
+        with self.assertRaises(ValueError) as said:
+            excel_filter.check_source({"key": "drives/D/items/ESC"}, "tok-valido", tempfile.mkdtemp())
+        self.assertIn("fora do Graph", str(said.exception))
 
 
 class LiveSources(unittest.TestCase):
@@ -1543,6 +1651,17 @@ class LiveSources(unittest.TestCase):
         self.assertEqual(len(excel_filter.base_load(self.folder)["rows"]), rows)  # replaced
         self.assertTrue(all(text.startswith("Tampadora - x = z") for text in self.texts()))
 
+    def test_a_synced_year_folder_is_walked_with_the_month_from_its_names(self):
+        year = Path(tempfile.mkdtemp()) / "Relatórios de Turno - General" / "2026"
+        for line, month in (("D01", "10 - Outubro"), ("D02", "09 - Setembro")):
+            (year / month).mkdir(parents=True)
+            shift_book(line).save(year / month / f"Relatório Linha {line[-1]}.xlsx")
+        (year / "10 - Outubro" / "~$Relatório Linha 1.xlsx").write_bytes(b"lock")
+        excel_filter.add_source("2026", str(year), self.folder)
+        self.assertEqual(excel_filter.sync_sources(self.folder), [("2026", "")])
+        self.assertEqual(sorted(e["key"] for e in excel_filter.base_entries(self.folder)),
+                         ["D01|2026-10", "D02|2026-09"])
+
     def test_one_broken_source_never_stops_the_others(self):
         excel_filter.add_source("perdido", str(self.zip.with_name("nao-existe.zip")), self.folder)
         excel_filter.add_source("outubro", str(self.zip), self.folder)
@@ -1550,7 +1669,7 @@ class LiveSources(unittest.TestCase):
         state = {s["label"]: s for s in excel_filter.load_sources(self.folder)["sources"]}
         self.assertIn("não encontrado", state["perdido"]["problem"])
         self.assertEqual(state["outubro"]["problem"], "")
-        self.assertTrue(state["outubro"]["version"].startswith("arquivo:"))
+        self.assertTrue(state["outubro"]["versions"][""].startswith("arquivo:"))
 
     def test_a_file_the_reader_cannot_open_is_tried_again(self):
         broken = self.zip.with_name("quebrado.zip")
@@ -1559,7 +1678,21 @@ class LiveSources(unittest.TestCase):
         excel_filter.sync_sources(self.folder)
         source = excel_filter.load_sources(self.folder)["sources"][0]
         self.assertTrue(source["problem"])
-        self.assertEqual(source["version"], "")  # unchanged: the next round reads it again
+        self.assertEqual(source["versions"], {})  # nothing kept: the next round reads it again
+
+    def test_a_spreadsheet_that_is_not_a_report_is_set_aside_until_it_changes(self):
+        other = Path(tempfile.mkdtemp()) / "2026" / "10 - Outubro"
+        other.mkdir(parents=True)
+        plain = Workbook()
+        plain.active.append(["Data", "Valor"])
+        plain.active.append([date(2026, 10, 1), 3])
+        plain.save(other / "Plano de produção.xlsx")
+        excel_filter.add_source("outubro", str(other), self.folder)
+        excel_filter.sync_sources(self.folder)
+        source = excel_filter.load_sources(self.folder)["sources"][0]
+        self.assertEqual(source["problem"], "")
+        self.assertIn("Plano de produção.xlsx", next(iter(source["ignored"].values())))
+        self.assertIn("Plano de produção.xlsx", source["versions"])  # not re-read every minute
 
     def test_sources_and_token_survive_and_a_broken_file_is_empty(self):
         excel_filter.set_token("tok", self.folder)

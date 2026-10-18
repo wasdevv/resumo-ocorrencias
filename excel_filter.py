@@ -30,7 +30,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 01:24"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 02:02"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -703,6 +703,9 @@ def base_load(folder=None):
 LOGIN_WALL = ("O link não devolveu um .zip nem um .xlsx — o SharePoint pediu login. Cole o token"
               " do Graph em Adicionar API, use um link que baixe sem login, ou Enviar .zip.")
 GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_HOST = "https://graph.microsoft.com/"
+SPREADSHEETS = (".xlsx", ".zip")
+WALK_LIMIT = 400  # files: a key at the root of a whole library would pull all of it
 GRAPH_PATHS = ("drives/", "sites/", "me/drive/")
 GRAPH_ERRORS = {401: "O token expirou ou não vale — cole um novo em Adicionar API.",
                 403: "O token não dá acesso a esse arquivo.",
@@ -729,15 +732,50 @@ def share_id(link):
     return "u!" + base64.urlsafe_b64encode(link.strip().encode()).decode().rstrip("=")
 
 
-def graph_item_url(key):
-    """Where Graph describes the file a key points to: a SharePoint link or a drives/... path."""
+def graph_key(key):
+    """The drives/... path inside whatever was pasted: a bare key, or a full Graph URL
+    ending in /content or /children — the forms Graph Explorer and Copilot hand out."""
     key = key.strip()
-    if key.startswith(("http://", "https://")):
+    if key[:4].upper() == "GET ":
+        key = key[4:].strip()
+    if key.startswith(GRAPH_HOST):
+        key = key[len(GRAPH_HOST):].split("?", 1)[0]
+        key = key.split("/", 1)[1] if key.startswith(("v1.0/", "beta/")) else key
+    for tail in ("/content", "/children"):
+        if key.endswith(tail):
+            key = key[:-len(tail)]
+    return key.lstrip("/")
+
+
+def graph_item_url(key):
+    """Where Graph describes what a key points to: a drives/... path or a SharePoint link."""
+    path = graph_key(key)
+    if path.startswith(GRAPH_PATHS):
+        return f"{GRAPH}/{path}"
+    if key.strip().startswith(("http://", "https://")):
         return f"{GRAPH}/shares/{share_id(key)}/driveItem"
-    if key.lstrip("/").startswith(GRAPH_PATHS):
-        return f"{GRAPH}/{key.lstrip('/')}"
-    raise ValueError("Com o token, a chave é o link do arquivo no SharePoint ou um caminho"
-                     " drives/<id>/items/<id>.")
+    raise ValueError("Com o token, a chave é drives/<id>/items/<id> (ou a URL do Graph com ela),"
+                     " ou o link do arquivo no SharePoint.")
+
+
+def month_of(names):
+    """(year, month) that folder and file names say — "2026" / "10 - Outubro" — or None.
+
+    The deepest name naming a month wins; its year is the one in that same name
+    or the nearest one above it. Without both, the workbook's own sheets decide.
+    """
+    for i in range(len(names) - 1, -1, -1):
+        said = month_from_name(names[i])
+        if not said:
+            continue
+        year = said[0]
+        for above in reversed(names[:i + 1]):
+            if year:
+                break
+            found = re.search(r"\b(20\d{2})\b", str(above))
+            year = int(found.group(1)) if found else None
+        return (year, said[1]) if year else None
+    return None
 
 
 def _graph_json(url, token, timeout=30):
@@ -794,41 +832,147 @@ def _save(request, folder, name=None, timeout=60):
     return partial.replace(Path(folder) / (stem + (".xlsx" if workbook else ".zip"))), tags
 
 
-def check_source(source, token="", folder=None, timeout=60):
-    """(version, local file or None, who changed it) for one live source.
+def _who(item):
+    """Who last changed a Graph item (lastModifiedBy.user.displayName), or ""."""
+    changed_by = item.get("lastModifiedBy")
+    user = changed_by.get("user") if isinstance(changed_by, dict) else None
+    return str(user.get("displayName") or "") if isinstance(user, dict) else ""
 
-    The file moves only when its version moved: the content tag Graph gives
-    (cTag), the ETag or Last-Modified a plain link answers with, or the time and
-    size of a file in a folder the OneDrive client keeps in sync.
+
+def _graph_names(item):
+    """The folder names above a Graph item (parentReference.path, percent-encoded) + its own."""
+    path = str((item.get("parentReference") or {}).get("path") or "")
+    above = path.split("root:", 1)[1] if "root:" in path else ""
+    return [urllib.parse.unquote(part) for part in above.split("/") if part] + [str(item.get("name") or "")]
+
+
+def _graph_item_of(item):
+    reference = item.get("parentReference") or {}
+    if not reference.get("driveId") or not item.get("id"):
+        raise ValueError("O Graph não disse onde fica esse item (driveId).")
+    return f"{GRAPH}/drives/{reference['driveId']}/items/{item['id']}"
+
+
+def _graph_files(folder_item, token, names, timeout, depth=0, found=None):
+    """[(file item, names)] under a Graph folder — ANO → MÊS → ARQUIVO, four levels down.
+
+    Pages are followed through @odata.nextLink (200 items a page), but only on
+    the Graph host: the token never travels anywhere else.
     """
-    key, known = str(source.get("key") or "").strip(), str(source.get("version") or "")
+    found = [] if found is None else found
+    url = _graph_item_of(folder_item) + "/children"
+    while url:
+        if not url.startswith(GRAPH):
+            raise ValueError("O Graph mandou continuar a lista fora do Graph — parei.")
+        page = _graph_json(url, token, timeout)
+        children = page.get("value") if isinstance(page.get("value"), list) else []
+        for child in (c for c in children if isinstance(c, dict)):
+            name = str(child.get("name") or "")
+            if "folder" in child:
+                if depth < 3:
+                    _graph_files(child, token, names + [name], timeout, depth + 1, found)
+            elif name.lower().endswith(SPREADSHEETS) and not name.startswith("~$"):
+                found.append((child, names + [name]))
+        if len(found) > WALK_LIMIT:
+            raise ValueError(f"Mais de {WALK_LIMIT} planilhas embaixo dessa chave — use a pasta"
+                             " do ano ou do mês.")
+        url = page.get("@odata.nextLink")
+    return found
+
+
+def source_versions(source):
+    """{file id: version} a source was last seen at (builds before folders kept just one)."""
+    versions = source.get("versions")
+    if isinstance(versions, dict):
+        return {str(k): str(v) for k, v in versions.items()}
+    return {"": str(source["version"])} if source.get("version") else {}
+
+
+def check_source(source, token="", folder=None, timeout=60):
+    """What one live source holds now: [(file id, version, fetch or None, who, month, name)].
+
+    A file key gives one entry; a folder key — the year, or a month — is walked
+    down to its spreadsheets, ANO → MÊS → ARQUIVO, the month read from the folder
+    names ("2026" / "10 - Outubro") instead of guessed. `fetch` is there only for
+    files whose version moved — the content tag Graph gives (cTag), the ETag a
+    plain link answers with, or the time and size of a synced file — and it
+    downloads when called, so one bad file never stops its siblings.
+    """
+    key = str(source.get("key") or "").strip()
     if not key:
         raise ValueError("Fonte sem chave.")
-    folder = folder or tempfile.mkdtemp()
-    if not key.startswith(("http://", "https://")) and not key.lstrip("/").startswith(GRAPH_PATHS):
-        try:  # a file the OneDrive client keeps in sync with SharePoint: no token needed
-            stat = Path(key).stat()
-        except OSError as error:
-            raise ValueError(f"Arquivo não encontrado: {key}") from error
-        version = f"arquivo:{stat.st_mtime_ns}:{stat.st_size}"
-        return version, (Path(key) if version != known else None), ""
+    known, folder = source_versions(source), Path(folder or tempfile.mkdtemp())
+    graph = graph_key(key).startswith(GRAPH_PATHS)
+    if not key.startswith(("http://", "https://")) and not graph:
+        return _check_local(Path(key), known)
     if token.strip():
-        item = _graph_json(graph_item_url(key), token, timeout)
-        version = "graph:" + str(item.get("cTag") or item.get("eTag")
-                                 or item.get("lastModifiedDateTime") or "")
-        changed_by = item.get("lastModifiedBy")
-        user = changed_by.get("user") if isinstance(changed_by, dict) else None
-        who = str(user.get("displayName") or "") if isinstance(user, dict) else ""
-        if version == known:
-            return version, None, who
-        url = item.get("@microsoft.graph.downloadUrl")
-        if not url:
-            raise ValueError("O Graph não deu o endereço de download — a chave é de uma pasta?")
-        # the download address is pre-signed: the token must not travel with it
-        path, _ = _save(urllib.request.Request(str(url)), folder, item.get("name"), timeout)
-        return version, path, who
-    if not key.startswith(("http://", "https://")):
-        raise ValueError("Uma chave drives/... só funciona com o token do Graph.")
+        return _check_graph(key, token, known, folder, timeout)
+    if graph:
+        raise ValueError("Essa chave é do Graph (drives/...): cole o token em Adicionar API.")
+    return [_check_link(key, known.get("", ""), folder, timeout)]
+
+
+def _check_local(path, known):
+    """A file, or a folder, the OneDrive client keeps in sync: versions from time and size."""
+    if path.is_dir():
+        files = sorted(p for p in path.rglob("*") if p.is_file()
+                       and p.suffix.lower() in SPREADSHEETS and not p.name.startswith("~$"))
+        if len(files) > WALK_LIMIT:
+            raise ValueError(f"Mais de {WALK_LIMIT} planilhas nessa pasta — use a do ano ou a do mês.")
+    elif path.is_file():
+        files = [path]
+    else:
+        raise ValueError(f"Arquivo ou pasta não encontrado: {path}")
+    found = []
+    for file in files:
+        stat = file.stat()
+        version = f"arquivo:{stat.st_mtime_ns}:{stat.st_size}"
+        inside = file != path
+        fid = file.relative_to(path).as_posix() if inside else ""
+        # only the names from the key down (plus its parent, for the year): a folder
+        # of the user's — "Maio Silva" — must not pass for a month
+        names = ([path.parent.name, path.name, *file.relative_to(path).parts] if inside
+                 else list(file.parts[-4:]))
+        found.append((fid, version, (lambda f=file: f) if known.get(fid) != version else None,
+                      "", month_of(names), file.name))
+    return found
+
+
+def _check_graph(key, token, known, folder, timeout):
+    """Through Microsoft Graph: the token goes to Graph only, never to a download address."""
+    item = _graph_json(graph_item_url(key), token, timeout)
+    names = _graph_names(item)
+    if "folder" in item:
+        files = [(str(child.get("id") or child_names[-1]), child, child_names)
+                 for child, child_names in _graph_files(item, token, names, timeout)]
+    else:
+        files = [("", item, names)]
+
+    def downloader(child, target):
+        def fetch():
+            url = child.get("@microsoft.graph.downloadUrl")
+            if not url:  # a listing may leave it out: ask the item itself
+                url = _graph_json(_graph_item_of(child), token, timeout).get(
+                    "@microsoft.graph.downloadUrl")
+            if not url:
+                raise ValueError("O Graph não deu o endereço de download — é uma pasta?")
+            target.mkdir(parents=True, exist_ok=True)
+            # the download address is pre-signed: the token must not travel with it
+            return _save(urllib.request.Request(str(url)), target, child.get("name"), timeout)[0]
+        return fetch
+
+    found = []
+    for index, (fid, child, child_names) in enumerate(files):
+        version = "graph:" + str(child.get("cTag") or child.get("eTag")
+                                 or child.get("lastModifiedDateTime") or "")
+        fetch = downloader(child, folder / str(index)) if known.get(fid) != version else None
+        found.append((fid, version, fetch, _who(child), month_of(child_names),
+                      str(child.get("name") or "")))
+    return found
+
+
+def _check_link(key, known, folder, timeout):
+    """A plain link: asks with the version it has; the server's 304 means nothing new."""
     headers = {"User-Agent": "Mozilla/5.0"}
     if known.startswith("etag:"):
         headers["If-None-Match"] = known[len("etag:"):]
@@ -837,7 +981,7 @@ def check_source(source, token="", folder=None, timeout=60):
     path, tags = _save(urllib.request.Request(direct_link(key), headers=headers), folder,
                        timeout=timeout)
     if path is None:  # 304: the same version as last time
-        return known, None, ""
+        return "", known, None, "", None, key
     if tags["etag"]:
         version = "etag:" + tags["etag"]
     elif tags["modified"]:
@@ -847,8 +991,8 @@ def check_source(source, token="", folder=None, timeout=60):
             version = "sha256:" + hashlib.file_digest(content, "sha256").hexdigest()
     if version == known:
         path.unlink()
-        return known, None, ""
-    return version, path, ""
+        return "", known, None, "", None, path.name
+    return "", version, (lambda p=path: p), "", month_of([path.name]), path.name
 
 
 def load_sources(folder=None):
@@ -901,25 +1045,48 @@ def set_token(token, folder=None):
 def sync_sources(folder=None):
     """Check every live source once and feed the base with what changed: [(label, who)].
 
-    One broken source never stops the others; its problem stays on it for the
-    screen. The version only moves after the base took the file, so a file that
-    could not be read is tried again on the next round.
+    One broken source, or one broken file inside a folder, never stops the rest;
+    the problem stays on the source for the screen. A file's version only moves
+    after it was read, so one that could not be read is fetched again next round;
+    one the base refuses (not a shift report) waits until it changes.
     """
     state, results, updated = load_sources(folder), {}, []
     for source in state["sources"]:
-        temp, now = tempfile.mkdtemp(), datetime.now().isoformat(timespec="seconds")
-        result = {"checked": now, "problem": ""}
+        label, temp = source.get("label") or "fonte", tempfile.mkdtemp()
+        now = datetime.now().isoformat(timespec="seconds")
         try:
-            version, path, who = check_source(source, state["token"], temp)
-            if path is not None:
-                base_add(load(path), f"{source.get('label', 'fonte')} · {path.name}", folder)
-                result.update(changed=now, by=who)
-                updated.append((source.get("label", "fonte"), who))
-            result["version"] = version
-        except Exception as error:  # one broken source must not stop the rest
-            result["problem"] = str(error) or type(error).__name__
-        finally:
+            entries = check_source(source, state["token"], temp)
+        except Exception as error:  # the whole source failed: it keeps what it knew
+            results[source["id"]] = {"checked": now, "problem": str(error) or type(error).__name__}
             shutil.rmtree(temp, ignore_errors=True)
+            continue
+        known, ignored = source_versions(source), dict(source.get("ignored") or {})
+        versions, problems, who_changed = {}, [], None
+        for fid, version, fetch, who, month, name in entries:
+            if fetch is None:
+                versions[fid] = version
+                continue
+            try:
+                data = load(fetch(), month)
+            except Exception as error:  # unreadable now — mid-upload, maybe: next round again
+                problems.append(f"{name}: {error}")
+                if fid in known:
+                    versions[fid] = known[fid]
+                continue
+            try:
+                base_add(data, f"{label} · {name}", folder)
+                ignored.pop(fid, None)
+                who_changed = who if who_changed is None or who else who_changed
+            except ValueError as error:  # read, but not for the base: wait for it to change
+                ignored[fid] = f"{name}: {error}"
+            versions[fid] = version
+        result = {"checked": now, "versions": versions, "files": len(entries),
+                  "ignored": {k: v for k, v in ignored.items() if k in versions},
+                  "problem": "; ".join(problems)}
+        if who_changed is not None:
+            result.update(changed=now, by=who_changed)
+            updated.append((label, who_changed))
+        shutil.rmtree(temp, ignore_errors=True)
         results[source["id"]] = result
 
     def merge(fresh):  # into the freshest file: a source added during the check survives
@@ -2281,8 +2448,7 @@ def main(path=None):
         pages.add(live, text="  Fontes em tempo real  ")
         pages.add(stored, text="  Na base  ")
         state = load_sources()
-        token, label, key, note = (tk.StringVar(value=state["token"]),
-                                   tk.StringVar(value=MONTH_NAMES[date.today().month - 1]),
+        token, label, key, note = (tk.StringVar(value=state["token"]), tk.StringVar(),
                                    tk.StringVar(), tk.StringVar())
 
         zip_row = ttk.Frame(live, style="Card.TFrame")
@@ -2305,21 +2471,24 @@ def main(path=None):
 
         add_row = ttk.Frame(live, style="Card.TFrame")
         add_row.pack(fill="x", pady=(16, 0))
-        ttk.Label(add_row, text="MÊS", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(add_row, text="NOME", style="Field.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(add_row, text="CHAVE", style="Field.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Combobox(add_row, textvariable=label, values=MONTH_NAMES, width=14).grid(
+        ttk.Combobox(add_row, textvariable=label, width=22,
+                     values=[str(date.today().year), *MONTH_NAMES]).grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=(4, 0))
         ttk.Entry(add_row, textvariable=key).grid(row=1, column=1, sticky="we", pady=(4, 0))
         ttk.Button(add_row, text="Adicionar fonte", style="Accent.TButton",
                    command=lambda: add()).grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
         add_row.columnconfigure(1, weight=1)
-        ttk.Label(live, style="Hint.TLabel", text="Chave = link do arquivo no SharePoint, caminho"
-                  " drives/<id>/items/<id>, ou o arquivo na pasta do OneDrive.").pack(
+        ttk.Label(live, style="Hint.TLabel", wraplength=930, text="Chave = drives/<id>/items/<id>"
+                  " de um arquivo ou de uma pasta (o ano, o mês — o app percorre tudo que tiver"
+                  " .xlsx dentro), a URL do Graph com ela (/content ou /children também servem),"
+                  " o link do SharePoint, ou o arquivo/pasta que o OneDrive sincroniza.").pack(
             anchor="w", pady=(4, 10))
 
         sources_table = ttk.Treeview(live, show="headings", selectmode="browse", height=6,
                                      columns=("mes", "chave", "quando", "por", "situacao"))
-        for column, caption, width in (("mes", "Mês", 90), ("chave", "Chave", 240),
+        for column, caption, width in (("mes", "Nome", 140), ("chave", "Chave", 220),
                                        ("quando", "Atualizado", 110), ("por", "Por", 120),
                                        ("situacao", "Situação", 300)):
             sources_table.heading(column, text=caption, anchor="w")
@@ -2365,9 +2534,15 @@ def main(path=None):
             sources_table.delete(*sources_table.get_children())
             for source in load_sources()["sources"]:
                 changed = str(source.get("changed") or "")
-                situation = (source.get("problem") or
-                             ("em dia · conferido {}".format(source["checked"][11:16])
-                              if source.get("version") else "aguardando a primeira leitura"))
+                ignored = list((source.get("ignored") or {}).values())
+                if source.get("problem"):
+                    situation = source["problem"]
+                elif source_versions(source):
+                    situation = "em dia · {} arquivo(s) · conferido {}{}".format(
+                        source.get("files", 1), str(source.get("checked", ""))[11:16],
+                        f" · ignorado: {ignored[0]}" if ignored else "")
+                else:
+                    situation = "aguardando a primeira leitura"
                 sources_table.insert("", "end", iid=source["id"], values=(
                     source.get("label", ""), short(source["key"]),
                     f"{changed[8:10]}/{changed[5:7]} {changed[11:16]}" if changed else "—",
