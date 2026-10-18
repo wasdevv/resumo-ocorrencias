@@ -14,7 +14,7 @@ máquina de quem usa). Código em inglês, tela em português.
 ```bash
 pip install -r requirements.txt
 python excel_filter.py            # abre a tela
-python -m unittest discover -s .  # 142 testes
+python -m unittest discover -s .  # 152 testes
 ```
 
 No Linux o Tkinter vem separado: `sudo apt install python3-tk`. No Windows já vem
@@ -99,25 +99,40 @@ Os mesmos filtros, vistos como números:
 Passar o mouse num dia mostra changeover, produzido, plano e % exatos. A janela
 abre maximizada.
 
-### Unilever e API (acesso e base salva)
+### Unilever, Deslogar e Adicionar API (acesso e base salva)
 
-Quem abre o app é **leitor**: vê só os filtros, as abas e o Baixar Dados, com a
-**base salva** já carregada. O botão **Unilever** pede login e senha; com a conta
-de admin aparecem **Abrir**, **+ Adicionar**, o histórico e o botão **API**.
-Clicar em Unilever de novo sai do modo admin. O login não fica lembrado: cada vez
-que o app abre, começa como leitor.
+Quem abre o app é **leitor**: vê o botão **Unilever**, os filtros, as abas e o
+Baixar Dados, com a **base salva** já carregada. Unilever abre o login; com a
+conta de admin, o mesmo botão vira **Deslogar** e aparecem **Abrir**,
+**+ Adicionar**, o histórico e, ao lado do Deslogar, **Adicionar API**. O login
+não fica lembrado: cada vez que o app abre, começa como leitor.
 
-O **API** alimenta a base de duas formas — o **link do SharePoint** (o app pede o
-arquivo com `download=1`) ou **Enviar zip...** — e lista o que ela guarda, uma
-linha por planilha (linha de produção, mês, linhas, origem, quando entrou). Dá
-para marcar várias e **Apagar selecionados**, com confirmação. A mesma linha no
-mesmo mês **substitui** a anterior: reenviar o zip, mesmo salvo como "(1)", não
-dobra nenhum total.
+**Adicionar API** tem duas abas:
 
-A base fica em `~/.resumo-ocorrencias/base/` (no Windows,
+- **Fontes em tempo real** — **Enviar .zip...** importa uma vez. O **token /
+  código** é o token de acesso do Microsoft Graph. Cada **fonte** é um mês (o
+  nome, ex.: outubro) e uma **chave**: o link do arquivo no SharePoint, um caminho
+  `drives/<id>/items/<id>` do Graph, ou o arquivo numa pasta que o OneDrive
+  sincroniza. Enquanto o app está aberto, ele confere cada fonte **a cada minuto**
+  e só baixa quando o arquivo mudou (o `cTag` do Graph, o ETag do link, ou a data
+  e o tamanho do arquivo sincronizado). Mudou — "Ricardo trocou x por z" — a base
+  é atualizada e a tela se refaz **mantendo os filtros** de quem está olhando, com
+  "Atualizado às 14:32: outubro (modificado por Ricardo)" na barra de status.
+- **Na base** — uma linha por planilha (linha de produção, mês, linhas, origem,
+  quando entrou); marque várias e **Apagar selecionados**, com confirmação.
+
+A mesma linha no mesmo mês **substitui** a anterior: reenviar o zip, mesmo salvo
+como "(1)", ou o mesmo mês chegar de novo pela fonte, não dobra nenhum total.
+
+Tudo fica em `~/.resumo-ocorrencias/base/` (no Windows,
 `C:\Users\<usuário>\.resumo-ocorrencias\base`): um índice e um arquivo por
-planilha, já lidos — abrir o app não relê os zips. Fechar o app não apaga nada;
-só o admin apaga.
+planilha, já lidos — abrir o app não relê os zips — e `fontes.json` com as fontes
+e o token. Fechar o app não apaga nada; só o admin apaga.
+
+Pelo Graph, o token vai só na consulta da descrição do arquivo; o download usa o
+endereço pré-assinado que o Graph devolve, sem token (como a documentação manda).
+Um token vencido aparece como "O token expirou" na fonte, uma vez, e as outras
+fontes continuam.
 
 A senha nunca é gravada: `admin.json` guarda o login, um sal e o hash PBKDF2. O
 arquivo fica **fora do git** (o repositório é público) e entra no `.exe` na hora
@@ -236,19 +251,28 @@ campos travados enquanto lê. A janela não congela mais.
   um servidor decidindo quem escreve.
 - A base é **deste computador**. Em outro PC o mesmo `.exe` começa com a base
   vazia.
-- Link do SharePoint que exige login da empresa (SSO) não baixa: o app diz isso
-  e o caminho é baixar o zip no navegador e usar Enviar zip. Ler com o login da
-  empresa exigiria registrar um app no Azure AD (Microsoft Graph).
+- O token do Graph colado à mão vale cerca de **1 hora**; depois a fonte para com
+  "O token expirou". Tempo real por meses sem ninguém colar token exige registrar
+  o app no Azure AD da empresa (TI), para ele renovar o acesso sozinho — ou usar
+  como chave o arquivo de uma pasta que o OneDrive sincroniza, que não precisa de
+  token nenhum.
+- "Tempo real" é conferir a cada minuto com o app aberto: um app de desktop não
+  recebe aviso do SharePoint (webhook pede endereço público).
+- O token fica em texto puro em `fontes.json`, na pasta do usuário.
+- O comportamento do Graph foi testado contra um servidor local escrito a partir
+  da documentação da Microsoft, não contra o SharePoint da Unilever.
 
 ---
 
 ## 8. Testes
 
-142 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
+152 testes com `unittest`, sem framework extra. Cobrem: leitura das abas por dia
 e das versões do modelo, mês de referência e conflitos, células mescladas, filtro
 por palavra/período/turno/linha, junção de pacotes, histórico, totais e
 desconhecidos, tempo de troca, sequência de SKU, gráficos (contando os retângulos
 desenhados num Tk de verdade), chips, máscara de data, a equivalência entre o
 leitor rápido e o lento, o login de admin, a base salva (ida e volta, reenvio sem
-duplicar, apagar, índice adulterado) e o download por link contra um servidor
-HTTP local de verdade.
+duplicar, apagar, índice adulterado) e as fontes em tempo real — link com ETag e
+304, Graph com o token só nos metadados e o `u!` do exemplo da documentação,
+arquivo sincronizado, fonte quebrada que não para as outras — contra servidores
+HTTP locais de verdade.

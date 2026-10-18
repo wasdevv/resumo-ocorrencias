@@ -3,6 +3,7 @@
 Code is English, the UI is pt-BR on purpose. Run with: python excel_filter.py
 """
 
+import base64
 import io
 import json
 import queue
@@ -29,7 +30,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
-BUILD = "18/10 01:10"  # carimbo do último commit, para saber qual versão está rodando
+BUILD = "18/10 01:24"  # carimbo do último commit, para saber qual versão está rodando
 DATE_FORMATS = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y",
                 "%d%m%Y", "%d%m%y")
 HOUR_RE = re.compile(r"\s*\d{1,2}\s*(h|:\d{2})\s*[-–às]*\s*(\d{1,2}\s*(h|:\d{2}))?\s*", re.I)
@@ -548,6 +549,7 @@ def is_admin(user, password, path=None):
 
 # --- Saved base: what the admin fed, kept until the admin deletes it --------------
 BASE_DIR = HISTORY_FILE.parent / "base"
+STORE_LOCK = threading.RLock()  # the polling thread and the screen both write here
 ENTRY_ID = re.compile(r"[0-9a-f]{16}")
 
 
@@ -628,23 +630,24 @@ def base_add(data, origin, folder=None):
     for number, values in data["rows"]:
         name = values[file_at] if file_at is not None else origin
         parts.setdefault(str(name), []).append((number, values))
-    entries, stale, saved, replaced = base_entries(folder), [], [], []
-    for name, rows in parts.items():
-        key, line, month = _workbook_key(headers, rows, name)
-        for old in [e for e in entries if e["key"] == key]:
-            entries.remove(old)
-            stale.append(old["id"])
-            replaced.append(old.get("file", ""))
-        entry = {"id": secrets.token_hex(8), "key": key, "file": name, "line": line,
-                 "month": list(month) if month else None, "rows": len(rows), "origin": origin,
-                 "added": datetime.now().isoformat(timespec="seconds")}
-        _write_json(folder / f"{entry['id']}.json",
-                    {"headers": headers, "rows": [values for _, values in rows]})
-        entries.append(entry)
-        saved.append(name)
-    _write_json(folder / "indice.json", entries)  # the new files exist before the index says so
-    for gone in stale:  # and the old ones go only after the index stopped pointing at them
-        (folder / f"{gone}.json").unlink(missing_ok=True)
+    with STORE_LOCK:
+        entries, stale, saved, replaced = base_entries(folder), [], [], []
+        for name, rows in parts.items():
+            key, line, month = _workbook_key(headers, rows, name)
+            for old in [e for e in entries if e["key"] == key]:
+                entries.remove(old)
+                stale.append(old["id"])
+                replaced.append(old.get("file", ""))
+            entry = {"id": secrets.token_hex(8), "key": key, "file": name, "line": line,
+                     "month": list(month) if month else None, "rows": len(rows),
+                     "origin": origin, "added": datetime.now().isoformat(timespec="seconds")}
+            _write_json(folder / f"{entry['id']}.json",
+                        {"headers": headers, "rows": [values for _, values in rows]})
+            entries.append(entry)
+            saved.append(name)
+        _write_json(folder / "indice.json", entries)  # new files exist before the index says so
+        for gone in stale:  # and the old ones go only after the index stopped pointing at them
+            (folder / f"{gone}.json").unlink(missing_ok=True)
     return saved, replaced
 
 
@@ -652,11 +655,12 @@ def base_remove(ids, folder=None):
     """Take workbooks out of the base for good; give back what is left."""
     folder = Path(folder or BASE_DIR)
     gone = {i for i in ids if ENTRY_ID.fullmatch(str(i))}
-    kept = [e for e in base_entries(folder) if e["id"] not in gone]
-    if folder.exists():
-        _write_json(folder / "indice.json", kept)
-    for i in gone:
-        (folder / f"{i}.json").unlink(missing_ok=True)
+    with STORE_LOCK:
+        kept = [e for e in base_entries(folder) if e["id"] not in gone]
+        if folder.exists():
+            _write_json(folder / "indice.json", kept)
+        for i in gone:
+            (folder / f"{i}.json").unlink(missing_ok=True)
     return kept
 
 
@@ -695,9 +699,16 @@ def base_load(folder=None):
             "columns": dict(SHIFT_COLUMNS)}
 
 
-# --- Feeding from a link -------------------------------------------------------------
-LOGIN_WALL = ("O link não devolveu um .zip nem um .xlsx — o SharePoint pediu login. Use um link"
-              " que baixe sem login, ou baixe o zip no navegador e use Enviar zip.")
+# --- Feeding from SharePoint: Graph, a plain link, or a folder OneDrive keeps in sync --
+LOGIN_WALL = ("O link não devolveu um .zip nem um .xlsx — o SharePoint pediu login. Cole o token"
+              " do Graph em Adicionar API, use um link que baixe sem login, ou Enviar .zip.")
+GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_PATHS = ("drives/", "sites/", "me/drive/")
+GRAPH_ERRORS = {401: "O token expirou ou não vale — cole um novo em Adicionar API.",
+                403: "O token não dá acesso a esse arquivo.",
+                404: "Nenhum arquivo com essa chave no SharePoint."}
+SOURCES_FILE = "fontes.json"
+SYNC_EVERY_MS = 60_000  # a minute: fresh enough for a shift report, one light call per file
 
 
 def direct_link(url):
@@ -713,14 +724,48 @@ def direct_link(url):
     return urllib.parse.urlunsplit(parts)
 
 
-def fetch_link(url, folder, timeout=60):
-    """Download what the link points to into `folder`; the local .zip or .xlsx path.
+def share_id(link):
+    """Graph's id for a sharing link: "u!" + the link in unpadded base64url (Graph docs)."""
+    return "u!" + base64.urlsafe_b64encode(link.strip().encode()).decode().rstrip("=")
 
-    Streamed to disk — a month of reports is hundreds of MB. A link that is not
-    public answers with a login page instead of the file: that is said, never
-    handed to the reader as if it were a spreadsheet.
+
+def graph_item_url(key):
+    """Where Graph describes the file a key points to: a SharePoint link or a drives/... path."""
+    key = key.strip()
+    if key.startswith(("http://", "https://")):
+        return f"{GRAPH}/shares/{share_id(key)}/driveItem"
+    if key.lstrip("/").startswith(GRAPH_PATHS):
+        return f"{GRAPH}/{key.lstrip('/')}"
+    raise ValueError("Com o token, a chave é o link do arquivo no SharePoint ou um caminho"
+                     " drives/<id>/items/<id>.")
+
+
+def _graph_json(url, token, timeout=30):
+    """The driveItem Graph describes, as a dict; every failure said in words."""
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.strip()}",
+                                                   "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            payload = json.loads(answer.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise ValueError(GRAPH_ERRORS.get(error.code, f"O Graph respondeu {error.code}.")) from error
+    except urllib.error.URLError as error:
+        raise ValueError(f"Não deu para falar com o Graph: {error.reason}") from error
+    except ValueError as error:
+        raise ValueError("O Graph respondeu algo que não é JSON.") from error
+    if not isinstance(payload, dict):  # "[]" and "7" parse as JSON too
+        raise ValueError("O Graph respondeu algo que não é a descrição de um arquivo.")
+    return payload
+
+
+def _save(request, folder, name=None, timeout=60):
+    """Stream a download into `folder`: (local .zip/.xlsx, {"etag", "modified"}), or
+    (None, {}) when the server answers 304 — nothing new since the version sent.
+
+    Streamed — a month of reports is hundreds of MB. A link that is not public
+    answers with a login page instead of the file: that is said, never handed to
+    the reader as if it were a spreadsheet.
     """
-    request = urllib.request.Request(direct_link(url), headers={"User-Agent": "Mozilla/5.0"})
     partial = Path(folder) / "download.part"
     try:
         with urllib.request.urlopen(request, timeout=timeout) as answer, open(partial, "wb") as out:
@@ -730,16 +775,159 @@ def fetch_link(url, folder, timeout=60):
             out.write(head)
             while chunk := answer.read(1 << 20):
                 out.write(chunk)
-            name = answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
+            tags = {"etag": answer.headers.get("ETag", ""),
+                    "modified": answer.headers.get("Last-Modified", "")}
+            name = name or answer.headers.get_filename() or urllib.parse.urlsplit(answer.geturl()).path
     except urllib.error.HTTPError as error:
+        if error.code == 304:
+            return None, {}
         raise ValueError(LOGIN_WALL if error.code in (401, 403)
                          else f"O link respondeu {error.code}.") from error
     except urllib.error.URLError as error:
         raise ValueError(f"Não deu para acessar o link: {error.reason}") from error
-    with zipfile.ZipFile(partial) as package:
-        workbook = "xl/workbook.xml" in package.namelist()
+    try:
+        with zipfile.ZipFile(partial) as package:
+            workbook = "xl/workbook.xml" in package.namelist()
+    except zipfile.BadZipFile as error:
+        raise ValueError("O arquivo baixado veio quebrado.") from error
     stem = re.sub(r'[<>:"/\\|?*]', "_", Path(urllib.parse.unquote(name or "")).stem) or "sharepoint"
-    return partial.replace(Path(folder) / (stem + (".xlsx" if workbook else ".zip")))
+    return partial.replace(Path(folder) / (stem + (".xlsx" if workbook else ".zip"))), tags
+
+
+def check_source(source, token="", folder=None, timeout=60):
+    """(version, local file or None, who changed it) for one live source.
+
+    The file moves only when its version moved: the content tag Graph gives
+    (cTag), the ETag or Last-Modified a plain link answers with, or the time and
+    size of a file in a folder the OneDrive client keeps in sync.
+    """
+    key, known = str(source.get("key") or "").strip(), str(source.get("version") or "")
+    if not key:
+        raise ValueError("Fonte sem chave.")
+    folder = folder or tempfile.mkdtemp()
+    if not key.startswith(("http://", "https://")) and not key.lstrip("/").startswith(GRAPH_PATHS):
+        try:  # a file the OneDrive client keeps in sync with SharePoint: no token needed
+            stat = Path(key).stat()
+        except OSError as error:
+            raise ValueError(f"Arquivo não encontrado: {key}") from error
+        version = f"arquivo:{stat.st_mtime_ns}:{stat.st_size}"
+        return version, (Path(key) if version != known else None), ""
+    if token.strip():
+        item = _graph_json(graph_item_url(key), token, timeout)
+        version = "graph:" + str(item.get("cTag") or item.get("eTag")
+                                 or item.get("lastModifiedDateTime") or "")
+        changed_by = item.get("lastModifiedBy")
+        user = changed_by.get("user") if isinstance(changed_by, dict) else None
+        who = str(user.get("displayName") or "") if isinstance(user, dict) else ""
+        if version == known:
+            return version, None, who
+        url = item.get("@microsoft.graph.downloadUrl")
+        if not url:
+            raise ValueError("O Graph não deu o endereço de download — a chave é de uma pasta?")
+        # the download address is pre-signed: the token must not travel with it
+        path, _ = _save(urllib.request.Request(str(url)), folder, item.get("name"), timeout)
+        return version, path, who
+    if not key.startswith(("http://", "https://")):
+        raise ValueError("Uma chave drives/... só funciona com o token do Graph.")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if known.startswith("etag:"):
+        headers["If-None-Match"] = known[len("etag:"):]
+    elif known.startswith("modificado:"):
+        headers["If-Modified-Since"] = known[len("modificado:"):]
+    path, tags = _save(urllib.request.Request(direct_link(key), headers=headers), folder,
+                       timeout=timeout)
+    if path is None:  # 304: the same version as last time
+        return known, None, ""
+    if tags["etag"]:
+        version = "etag:" + tags["etag"]
+    elif tags["modified"]:
+        version = "modificado:" + tags["modified"]
+    else:  # a server that says nothing about versions: the content decides
+        with open(path, "rb") as content:
+            version = "sha256:" + hashlib.file_digest(content, "sha256").hexdigest()
+    if version == known:
+        path.unlink()
+        return known, None, ""
+    return version, path, ""
+
+
+def load_sources(folder=None):
+    """{"token", "sources"} that Adicionar API keeps. A missing or broken file is empty."""
+    try:
+        saved = json.loads((Path(folder or BASE_DIR) / SOURCES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    sources = saved.get("sources") if isinstance(saved.get("sources"), list) else []
+    return {"token": str(saved.get("token") or ""),
+            "sources": [s for s in sources if isinstance(s, dict) and s.get("key")
+                        and ENTRY_ID.fullmatch(str(s.get("id", "")))]}
+
+
+def _change_sources(change, folder=None):
+    """Read, change and write fontes.json under the store lock; the new state."""
+    folder = Path(folder or BASE_DIR)
+    with STORE_LOCK:
+        state = load_sources(folder)
+        change(state)
+        folder.mkdir(parents=True, exist_ok=True)
+        _write_json(folder / SOURCES_FILE, state)
+    return state
+
+
+def add_source(label, key, folder=None):
+    """Follow a file from now on; it is read on the next check."""
+    key = key.strip()
+    if not key:
+        raise ValueError("Cole a chave: o link do arquivo, um caminho drives/..., ou o arquivo"
+                         " da pasta que o OneDrive sincroniza.")
+    if key.startswith(("http://", "https://")):
+        direct_link(key)  # says what is wrong with the link before it is saved
+    entry = {"id": secrets.token_hex(8), "label": label.strip() or "fonte", "key": key,
+             "version": "", "checked": "", "changed": "", "by": "", "problem": ""}
+    return _change_sources(lambda state: state["sources"].append(entry), folder)
+
+
+def remove_source(source_id, folder=None):
+    """Stop following a file. What it already brought stays in the base."""
+    return _change_sources(lambda state: state.update(
+        sources=[s for s in state["sources"] if s["id"] != source_id]), folder)
+
+
+def set_token(token, folder=None):
+    return _change_sources(lambda state: state.update(token=token.strip()), folder)
+
+
+def sync_sources(folder=None):
+    """Check every live source once and feed the base with what changed: [(label, who)].
+
+    One broken source never stops the others; its problem stays on it for the
+    screen. The version only moves after the base took the file, so a file that
+    could not be read is tried again on the next round.
+    """
+    state, results, updated = load_sources(folder), {}, []
+    for source in state["sources"]:
+        temp, now = tempfile.mkdtemp(), datetime.now().isoformat(timespec="seconds")
+        result = {"checked": now, "problem": ""}
+        try:
+            version, path, who = check_source(source, state["token"], temp)
+            if path is not None:
+                base_add(load(path), f"{source.get('label', 'fonte')} · {path.name}", folder)
+                result.update(changed=now, by=who)
+                updated.append((source.get("label", "fonte"), who))
+            result["version"] = version
+        except Exception as error:  # one broken source must not stop the rest
+            result["problem"] = str(error) or type(error).__name__
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+        results[source["id"]] = result
+
+    def merge(fresh):  # into the freshest file: a source added during the check survives
+        for source in fresh["sources"]:
+            source.update(results.get(source["id"], {}))
+
+    _change_sources(merge, folder)
+    return updated
 
 
 def load(path, month=None, progress=None):
@@ -1602,7 +1790,7 @@ def main(path=None):
     open_button = ttk.Button(file_buttons, text="Abrir...", style="Accent.TButton",
                              command=lambda: open_file())
     add_button = ttk.Button(file_buttons, text="+ Adicionar", command=lambda: open_file(add=True))
-    api_button = ttk.Button(file_buttons, text="API", command=lambda: open_api())
+    api_button = ttk.Button(file_buttons, text="Adicionar API", command=lambda: open_api())
     login_button = ttk.Button(file_buttons, text="Unilever", command=lambda: toggle_login())
     login_button.pack(side="left")
     ttk.Label(file_side, textvariable=who, style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
@@ -1929,8 +2117,12 @@ def main(path=None):
         line_box.configure(state="disabled")
         redraw()
 
-    def show_base(announce=None):
-        """Put the saved base on screen — what everyone sees when the app opens."""
+    def show_base(announce=None, keep_filters=False):
+        """Put the saved base on screen — what everyone sees when the app opens.
+
+        An automatic refresh keeps the dates, turno, lines and keyword the person
+        was looking at: a change in SharePoint must not undo their filter.
+        """
         data = base_load() or {}
         missing = data.get("missing") or []
         if not data.get("rows"):
@@ -1939,10 +2131,18 @@ def main(path=None):
             if missing:
                 say("Nada da base abriu: " + ", ".join(missing), dark["error"])
             else:
-                say("A base está vazia — o admin entra em Unilever e alimenta pelo botão API.")
+                say("A base está vazia — o admin entra em Unilever e alimenta em Adicionar API.")
             return
+        kept = ((start_date.get(), end_date.get(), keyword.get(), hour.get(),
+                 list(book.get("chosen") or [])) if keep_filters and book.get("rows") else None)
         book["adding"] = False
         finish(data)
+        if kept:
+            for field, value in zip((start_date, end_date, keyword, hour), kept):
+                field.set(value)
+            book["chosen"] = [line for line in kept[4] if line in book["lines"]]
+            redraw()
+            refresh()
         if missing:  # smaller totals must not pass for whole ones
             say("Não abriram da base, e os totais estão sem eles: " + ", ".join(missing),
                 dark["error"])
@@ -1958,26 +2158,30 @@ def main(path=None):
         dialog.geometry(f"{width}x{height}+{x}+{y}" if size else f"+{x}+{y}")
 
     def apply_role():
-        """Viewer: filters and results. Admin: also open files, history and the API."""
+        """Viewer: the Unilever button. Admin: Abrir, + Adicionar, Deslogar, Adicionar API."""
         admin = book.get("admin")
-        for button in (open_button, add_button, api_button):
+        for button in (open_button, add_button):
             if admin:
                 button.pack(side="left", padx=(0, 8), before=login_button)
             else:
                 button.pack_forget()
         if admin:
+            api_button.pack(side="left", padx=(8, 0), after=login_button)
             reopen_bar.grid()
         else:
+            api_button.pack_forget()
             reopen_bar.grid_remove()
+            if book.get("api") and book["api"].winfo_exists():
+                book["api"].destroy()  # an admin window must not outlive the admin
+        login_button.configure(text="Deslogar" if admin else "Unilever")
         who.set(f"admin: {admin}" if admin else "")
 
     def toggle_login():
-        """The Unilever button: log in as admin, or out again."""
+        """Unilever opens the login; once in, the same button is Deslogar."""
         if book.get("admin"):
-            if messagebox.askyesno("Unilever", f"Sair do modo admin ({book['admin']})?"):
-                book["admin"] = None
-                apply_role()
-                say("Saiu do modo admin.")
+            book["admin"] = None
+            apply_role()
+            say("Deslogado.")
             return
         dialog = tk.Toplevel(root, background=dark["card"], padx=24, pady=20)
         dialog.title("Unilever — entrar")
@@ -2000,8 +2204,7 @@ def main(path=None):
                 book["admin"] = user.get().strip()
                 dialog.destroy()
                 apply_role()
-                say(f"Modo admin ({book['admin']}): o botão API alimenta e apaga a base salva.",
-                    dark["ok"])
+                say(f"Logado como {book['admin']}: Adicionar API alimenta a base.", dark["ok"])
             else:
                 secret.set("")
                 problem.set("Login ou senha não conferem.")
@@ -2015,81 +2218,218 @@ def main(path=None):
         user_entry.focus_set()
         dialog.grab_set()
 
+    def sync_now():
+        """Check the live sources off the UI thread; refresh the screen if any changed."""
+        if book.get("syncing") or not load_sources()["sources"]:
+            return
+        book["syncing"] = True
+        news = queue.Queue()
+
+        def work():
+            try:
+                news.put(("ok", sync_sources()))
+            except Exception as error:
+                news.put(("erro", error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                kind, payload = news.get_nowait()
+            except queue.Empty:
+                root.after(200, poll)
+                return
+            book["syncing"] = False
+            if book.get("api_refresh"):
+                book["api_refresh"]()
+            if kind == "erro":
+                say(f"Erro ao atualizar as fontes: {payload}", dark["error"])
+                return
+            if payload:
+                said = "Atualizado às {}: {}.".format(datetime.now().strftime("%H:%M"), ", ".join(
+                    label + (f" (modificado por {who})" if who else "") for label, who in payload))
+                if not book.get("rows") or (book.get("data") or {}).get("base"):
+                    show_base(said, keep_filters=True)
+                else:  # the admin opened a file by hand: say it, do not swap the screen
+                    say(said + " Mostre a base em Adicionar API para ver.", dark["ok"])
+            broken = [s for s in load_sources()["sources"] if s.get("problem")]
+            problems = {(s["id"], s["problem"]) for s in broken}
+            if problems and problems != book.get("problems"):  # say it once, not every minute
+                say(f"Fonte {broken[0]['label']}: {broken[0]['problem']}", dark["error"])
+            book["problems"] = problems
+
+        root.after(200, poll)
+
+    def keep_syncing():
+        sync_now()
+        root.after(SYNC_EVERY_MS, keep_syncing)
+
     def open_api():
-        """Admin only: feed the saved base from a SharePoint link or a zip, or delete from it."""
+        """Admin only: .zip, the Graph token, live sources per month, and the base itself."""
         if not book.get("admin"):
             return
         if book.get("api") and book["api"].winfo_exists():
             book["api"].lift()
             return
         dialog = book["api"] = tk.Toplevel(root, background=dark["card"], padx=20, pady=16)
-        dialog.title("API — base salva")
+        dialog.title("Adicionar API")
         dialog.transient(root)
-        try:
-            remembered = (BASE_DIR / "link.txt").read_text(encoding="utf-8").strip()
-        except OSError:
-            remembered = ""
-        link, note = tk.StringVar(value=remembered), tk.StringVar()
+        pages = ttk.Notebook(dialog)
+        pages.pack(fill="both", expand=True)
+        live = tk.Frame(pages, background=dark["card"], padx=4, pady=12)
+        stored = tk.Frame(pages, background=dark["card"], padx=4, pady=12)
+        pages.add(live, text="  Fontes em tempo real  ")
+        pages.add(stored, text="  Na base  ")
+        state = load_sources()
+        token, label, key, note = (tk.StringVar(value=state["token"]),
+                                   tk.StringVar(value=MONTH_NAMES[date.today().month - 1]),
+                                   tk.StringVar(), tk.StringVar())
 
-        ttk.Label(dialog, text="LINK DO SHAREPOINT", style="Field.TLabel").pack(anchor="w")
-        feed_row = ttk.Frame(dialog, style="Card.TFrame")
-        feed_row.pack(fill="x", pady=(4, 4))
-        ttk.Entry(feed_row, textvariable=link).pack(side="left", fill="x", expand=True)
-        fetch_button = ttk.Button(feed_row, text="Baixar do link", style="Accent.TButton",
-                                  command=lambda: feed_link())
-        fetch_button.pack(side="left", padx=(8, 0))
-        send_button = ttk.Button(feed_row, text="Enviar zip...", command=lambda: feed_file())
-        send_button.pack(side="left", padx=(8, 0))
-        ttk.Label(dialog, style="Hint.TLabel",
-                  text="A mesma linha no mesmo mês substitui o que estava — reenviar não"
-                       " duplica.").pack(anchor="w", pady=(0, 14))
+        zip_row = ttk.Frame(live, style="Card.TFrame")
+        zip_row.pack(fill="x")
+        send_button = ttk.Button(zip_row, text="Enviar .zip...", command=lambda: feed_file())
+        send_button.pack(side="left")
+        ttk.Label(zip_row, style="Hint.TLabel", text="importa uma vez · a mesma linha no mesmo mês"
+                  " substitui a anterior").pack(side="left", padx=(12, 0))
 
-        ttk.Label(dialog, text="NA BASE", style="Field.TLabel").pack(anchor="w")
-        table = ttk.Treeview(dialog, show="headings", selectmode="extended", height=10,
-                             columns=("linha", "mes", "linhas", "planilha", "origem", "quando"))
-        for key, caption, width in (("linha", "Linha", 70), ("mes", "Mês", 80),
-                                    ("linhas", "Linhas", 70), ("planilha", "Planilha", 280),
-                                    ("origem", "Origem", 220), ("quando", "Adicionado", 140)):
-            table.heading(key, text=caption, anchor="w")
-            table.column(key, width=width, anchor="w", stretch=key in ("planilha", "origem"))
-        table.pack(fill="both", expand=True, pady=(4, 10))
-        bottom = ttk.Frame(dialog, style="Card.TFrame")
-        bottom.pack(fill="x")
-        delete_button = ttk.Button(bottom, text="Apagar selecionados", command=lambda: delete())
-        delete_button.pack(side="left")
-        ttk.Button(bottom, text="Mostrar a base na tela", command=lambda: show_base()).pack(
+        ttk.Label(live, text="TOKEN / CÓDIGO (MICROSOFT GRAPH)", style="Field.TLabel").pack(
+            anchor="w", pady=(16, 4))
+        token_row = ttk.Frame(live, style="Card.TFrame")
+        token_row.pack(fill="x")
+        ttk.Entry(token_row, textvariable=token, show="•").pack(side="left", fill="x", expand=True)
+        ttk.Button(token_row, text="Salvar token", command=lambda: save_token()).pack(
             side="left", padx=(8, 0))
-        ttk.Label(bottom, textvariable=note, style="Hint.TLabel").pack(side="left", padx=(12, 0))
+        ttk.Label(live, style="Hint.TLabel", wraplength=930, text="O token de acesso do Graph vale"
+                  " cerca de 1 hora. Sem token, a chave precisa ser um link que baixe sem login ou"
+                  " um arquivo da pasta que o OneDrive sincroniza.").pack(anchor="w", pady=(4, 0))
+
+        add_row = ttk.Frame(live, style="Card.TFrame")
+        add_row.pack(fill="x", pady=(16, 0))
+        ttk.Label(add_row, text="MÊS", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(add_row, text="CHAVE", style="Field.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(add_row, textvariable=label, values=MONTH_NAMES, width=14).grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(4, 0))
+        ttk.Entry(add_row, textvariable=key).grid(row=1, column=1, sticky="we", pady=(4, 0))
+        ttk.Button(add_row, text="Adicionar fonte", style="Accent.TButton",
+                   command=lambda: add()).grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
+        add_row.columnconfigure(1, weight=1)
+        ttk.Label(live, style="Hint.TLabel", text="Chave = link do arquivo no SharePoint, caminho"
+                  " drives/<id>/items/<id>, ou o arquivo na pasta do OneDrive.").pack(
+            anchor="w", pady=(4, 10))
+
+        sources_table = ttk.Treeview(live, show="headings", selectmode="browse", height=6,
+                                     columns=("mes", "chave", "quando", "por", "situacao"))
+        for column, caption, width in (("mes", "Mês", 90), ("chave", "Chave", 240),
+                                       ("quando", "Atualizado", 110), ("por", "Por", 120),
+                                       ("situacao", "Situação", 300)):
+            sources_table.heading(column, text=caption, anchor="w")
+            sources_table.column(column, width=width, anchor="w",
+                                 stretch=column in ("chave", "situacao"))
+        sources_table.pack(fill="both", expand=True)
+        live_bottom = ttk.Frame(live, style="Card.TFrame")
+        live_bottom.pack(fill="x", pady=(8, 0))
+        ttk.Button(live_bottom, text="Remover fonte", command=lambda: drop()).pack(side="left")
+        ttk.Button(live_bottom, text="Verificar agora", command=sync_now).pack(side="left",
+                                                                              padx=(8, 0))
+        ttk.Label(live_bottom, textvariable=note, style="Hint.TLabel").pack(side="left",
+                                                                            padx=(12, 0))
+
+        base_table = ttk.Treeview(stored, show="headings", selectmode="extended", height=12,
+                                  columns=("linha", "mes", "linhas", "planilha", "origem", "quando"))
+        for column, caption, width in (("linha", "Linha", 70), ("mes", "Mês", 80),
+                                       ("linhas", "Linhas", 70), ("planilha", "Planilha", 280),
+                                       ("origem", "Origem", 220), ("quando", "Adicionado", 140)):
+            base_table.heading(column, text=caption, anchor="w")
+            base_table.column(column, width=width, anchor="w",
+                              stretch=column in ("planilha", "origem"))
+        base_table.pack(fill="both", expand=True)
+        stored_bottom = ttk.Frame(stored, style="Card.TFrame")
+        stored_bottom.pack(fill="x", pady=(8, 0))
+        delete_button = ttk.Button(stored_bottom, text="Apagar selecionados",
+                                   command=lambda: delete())
+        delete_button.pack(side="left")
+        ttk.Button(stored_bottom, text="Mostrar a base na tela", command=lambda: show_base()).pack(
+            side="left", padx=(8, 0))
+        base_note = tk.StringVar()
+        ttk.Label(stored_bottom, textvariable=base_note, style="Hint.TLabel").pack(
+            side="left", padx=(12, 0))
+
+        def short(text):
+            """A key fits the column: the end of a link or a path says which file it is."""
+            text = str(text)
+            return text if len(text) <= 42 else "…" + text[-41:]
 
         def fill():
-            table.delete(*table.get_children())
+            if not dialog.winfo_exists():
+                return
+            sources_table.delete(*sources_table.get_children())
+            for source in load_sources()["sources"]:
+                changed = str(source.get("changed") or "")
+                situation = (source.get("problem") or
+                             ("em dia · conferido {}".format(source["checked"][11:16])
+                              if source.get("version") else "aguardando a primeira leitura"))
+                sources_table.insert("", "end", iid=source["id"], values=(
+                    source.get("label", ""), short(source["key"]),
+                    f"{changed[8:10]}/{changed[5:7]} {changed[11:16]}" if changed else "—",
+                    source.get("by") or "—", situation))
+            note.set("confere a cada minuto enquanto o app está aberto"
+                     + (" · verificando..." if book.get("syncing") else ""))
+            base_table.delete(*base_table.get_children())
             for entry in sorted(base_entries(), key=lambda e: (str(e.get("line") or ""),
                                                                e.get("month") or [0, 0])):
                 month = entry.get("month")
-                table.insert("", "end", iid=entry["id"], values=(
+                base_table.insert("", "end", iid=entry["id"], values=(
                     entry.get("line") or "—", f"{month[1]:02d}/{month[0]}" if month else "?",
                     thousands(entry.get("rows", 0)), entry.get("file", ""),
                     entry.get("origin", ""), str(entry.get("added", "")).replace("T", " ")[:16]))
-            note.set(f"{len(table.get_children())} planilhas na base")
+            base_note.set(f"{len(base_table.get_children())} planilhas na base")
 
-        def feed(get_path, origin_of, url=None):
-            """Read off the UI thread, save into the base, then put the base on screen."""
-            for button in (fetch_button, send_button, delete_button):
-                button.state(["disabled"])
+        book["api_refresh"] = fill
+
+        def save_token():
+            set_token(token.get())
+            say("Token salvo: as fontes são conferidas agora e a cada minuto.", dark["ok"])
+            sync_now()
+            fill()
+
+        def add():
+            try:
+                add_source(label.get(), key.get())
+            except ValueError as error:
+                messagebox.showerror("Adicionar API", str(error), parent=dialog)
+                return
+            key.set("")
+            sync_now()  # the first check is the first download
+            fill()
+
+        def drop():
+            picked = sources_table.selection()
+            if not picked:
+                note.set("Selecione a fonte que vai sair.")
+                return
+            name = sources_table.set(picked[0], "mes")
+            if messagebox.askyesno("Remover fonte", f"Parar de acompanhar {name}? O que ela já"
+                                   " trouxe continua na base.", parent=dialog):
+                remove_source(picked[0])
+                fill()
+
+        def feed_file():
+            chosen = filedialog.askopenfilename(
+                parent=dialog, initialdir=start_dir(),
+                filetypes=[("Pacote ou Excel", "*.zip *.xlsx"), ("Pacote de relatórios", "*.zip")])
+            if not chosen:
+                return
+            send_button.state(["disabled"])
             note.set("Lendo...")
             news = queue.Queue()
 
             def work():
-                folder = tempfile.mkdtemp()
                 try:
-                    path = get_path(folder)
-                    data = load(path, progress=lambda i, n, name: news.put(
+                    data = load(chosen, progress=lambda i, n, name: news.put(
                         ("step", f"Lendo {i}/{n}: {name}")))
-                    news.put(("ok", base_add(data, origin_of(path))))
+                    news.put(("ok", base_add(data, Path(chosen).name)))
                 except Exception as error:
                     news.put(("erro", error))
-                finally:
-                    shutil.rmtree(folder, ignore_errors=True)
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -2103,14 +2443,11 @@ def main(path=None):
                     note.set(payload)
                     dialog.after(50, poll)
                     return
-                for button in (fetch_button, send_button, delete_button):
-                    button.state(["!disabled"])
+                send_button.state(["!disabled"])
                 if kind == "erro":
                     note.set("")
-                    messagebox.showerror("API", str(payload), parent=dialog)
+                    messagebox.showerror("Adicionar API", str(payload), parent=dialog)
                     return
-                if url:  # the link worked: offer it again next time
-                    (BASE_DIR / "link.txt").write_text(url, encoding="utf-8")
                 saved, replaced = payload
                 fill()
                 show_base("{} planilha(s) salvas na base{}.".format(
@@ -2118,28 +2455,12 @@ def main(path=None):
 
             dialog.after(100, poll)
 
-        def feed_link():
-            url = link.get().strip()
-            try:
-                direct_link(url)
-            except ValueError as error:
-                messagebox.showerror("API", str(error), parent=dialog)
-                return
-            feed(lambda folder: fetch_link(url, folder), lambda path: f"link · {path.name}", url)
-
-        def feed_file():
-            chosen = filedialog.askopenfilename(
-                parent=dialog, initialdir=start_dir(),
-                filetypes=[("Pacote ou Excel", "*.zip *.xlsx"), ("Pacote de relatórios", "*.zip")])
-            if chosen:
-                feed(lambda folder: Path(chosen), lambda path: path.name)
-
         def delete():
-            picked = table.selection()
+            picked = base_table.selection()
             if not picked:
-                note.set("Selecione o que apagar (Ctrl ou Shift marcam vários).")
+                base_note.set("Selecione o que apagar (Ctrl ou Shift marcam vários).")
                 return
-            names = [table.set(i, "planilha") for i in picked]
+            names = [base_table.set(i, "planilha") for i in picked]
             shown = "\n".join(names[:12]) + ("\n..." if len(names) > 12 else "")
             if not messagebox.askyesno("Apagar da base", "Apagar {} planilha(s) da base para"
                                        " sempre?\n\n{}".format(len(picked), shown), parent=dialog):
@@ -2149,7 +2470,7 @@ def main(path=None):
             show_base(f"{len(picked)} planilha(s) apagadas da base.")
 
         fill()
-        centre(dialog, (940, 560))
+        centre(dialog, (1000, 640))
 
     def as_date(text):
         if not text.strip():
@@ -2436,6 +2757,7 @@ def main(path=None):
         root.after(50, lambda: open_file(path))
     else:
         root.after(50, show_base)
+    root.after(2000, keep_syncing)  # live sources: checked now and every minute after
     root.mainloop()
 
 

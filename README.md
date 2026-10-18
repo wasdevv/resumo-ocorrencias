@@ -127,10 +127,12 @@ calada. Os valores lidos são os **calculados** — a coluna pode ser fórmula, 
 ## Acesso e base salva
 
 Quem abre o app só filtra e lê a **base salva**, carregada ao abrir. O botão
-**Unilever** faz o login de admin, que libera Abrir, + Adicionar, histórico e
-**API** — alimentar a base por link do SharePoint ou zip, e apagar planilhas
-dela. A base vive em `~/.resumo-ocorrencias/base/` e sobrevive ao fechar o app;
-a mesma linha no mesmo mês substitui a anterior.
+**Unilever** faz o login de admin; logado, ele vira **Deslogar** e aparecem
+Abrir, + Adicionar, histórico e **Adicionar API**: `.zip`, o token do Microsoft
+Graph e as **fontes em tempo real** (mês + chave: link do SharePoint, caminho
+`drives/...` ou arquivo da pasta do OneDrive), conferidas a cada minuto e baixadas
+só quando mudam. A base vive em `~/.resumo-ocorrencias/base/` e sobrevive ao
+fechar o app; a mesma linha no mesmo mês substitui a anterior.
 
 `admin.json` (login + hash PBKDF2, nunca a senha) fica fora do git e entra no
 `.exe` no build: `python excel_filter.py --admin <login>` cria o arquivo.
@@ -150,4 +152,5 @@ O turno é lido da hora em que cada linha **começa**: "13h - 14h" é 1º turno.
 - Ler o arquivo de 59MB leva ~20s (uma vez só, os filtros depois são instantâneos).
 - O login de admin é uma porta na tela, não segurança: o `.exe` pode ser
   desempacotado. A base é por computador.
-- Link do SharePoint que pede o login da empresa não baixa; use Enviar zip.
+- Token do Graph colado à mão vale ~1 hora; tempo real contínuo pede o app
+  registrado no Azure AD da empresa, ou a pasta sincronizada pelo OneDrive.
